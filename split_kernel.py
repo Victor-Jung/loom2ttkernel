@@ -7,8 +7,10 @@ will be written to its own file.
 
 import argparse
 import json
+import collections
 import os
 import re
+import sys
 from pathlib import Path
 
 
@@ -1776,11 +1778,63 @@ def generate_host_ttnn_source(host_pybind_lines, source_cpp_filename):
     return source
 
 
+def check_cb_balance(lines, filename):
+    """Verify the circular-buffer protocol of one generated device kernel.
+
+On Tenstorrent a `cb_pop_front(cb, n)` is normally preceded in the same
+    kernel by a `cb_wait_front(cb, n)`: the wait blocks until the producer has
+    pushed, and the pop releases the pages. Emitting a pop without a wait
+    advances the read pointer for data that may not have arrived, and leaving a
+    wait unmatched never frees the pages, so the producer eventually blocks in
+    cb_reserve_back. Either way the kernel deadlocks *on device*, which shows up
+    as a 10-second core timeout and wedges the board until tt-smi -r.
+
+    Failing here turns that into a compile-time error naming the buffer.
+
+    Returns (imbalanced, surplus_waits), both advisory.
+
+    CAVEAT: these are lexical counts and do NOT prove a deadlock. A pop inside a
+    loop with its wait outside counts as "unbalanced" while being correct at
+    runtime. Flash attention trips both directions and runs correctly on
+    hardware, so this must never gate compilation -- treat it as a hint about
+    where to look, not a verdict.
+    """
+    text = "".join(lines)
+    waits = collections.Counter(re.findall(r"cb_wait_front\(\s*([A-Za-z_][A-Za-z0-9_]*)", text))
+    pops = collections.Counter(re.findall(r"cb_pop_front\(\s*([A-Za-z_][A-Za-z0-9_]*)", text))
+    # Only named CB globals are checked; helper-function parameters (in_cb,
+    # out_cb, cb_id, ...) are per-call aliases and cannot be reasoned about here.
+    names = {n for n in set(waits) | set(pops) if n.startswith("cb_id_")}
+    errors, warnings = [], []
+    for name in sorted(names):
+        w, pcount = waits[name], pops[name]
+        if pcount > w:
+            # Fatal: the consumer releases pages it never waited for, so it can
+            # advance the read pointer past data that has not arrived.
+            errors.append(
+                f"{filename}: {name} has {pcount} cb_pop_front but only {w} "
+                f"cb_wait_front -- pop without a matching wait"
+            )
+        elif w > pcount:
+            # Not fatal on its own: pages stay reserved, which only deadlocks if
+            # the producer later needs them back. Flash attention ships with
+            # this shape and runs correctly, so warn rather than reject.
+            warnings.append(
+                f"{filename}: {name} has {w} cb_wait_front but only {pcount} "
+                f"cb_pop_front -- pages are never released"
+            )
+    return errors, warnings
+
+
 def _write_section_outputs(output_path, current_filename, current_section):
     output_file = output_path / current_filename
     processed_section = process_source_content(current_section, current_filename)
     if current_filename.startswith("host_pybind"):
         processed_section = transform_host_pybind_source(processed_section)
+    if current_filename in ("compute.cpp", "reader.cpp", "writer.cpp"):
+        errors, warnings = check_cb_balance(processed_section, current_filename)
+        for msg in errors + warnings:
+            print(f"warning: circular-buffer protocol: {msg}", file=sys.stderr)
     with open(output_file, 'w', encoding='utf-8') as out_f:
         out_f.writelines(processed_section)
     print(f"Created: {output_file}")
