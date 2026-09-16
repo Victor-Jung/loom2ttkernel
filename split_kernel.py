@@ -1793,18 +1793,36 @@ On Tenstorrent a `cb_pop_front(cb, n)` is normally preceded in the same
 
     Returns (imbalanced, surplus_waits), both advisory.
 
-    CAVEAT: these are lexical counts and do NOT prove a deadlock. A pop inside a
-    loop with its wait outside counts as "unbalanced" while being correct at
-    runtime. Flash attention trips both directions and runs correctly on
-    hardware, so this must never gate compilation -- treat it as a hint about
-    where to look, not a verdict.
+    CAVEAT: these are lexical, intraprocedural counts and do NOT prove a
+    deadlock. Two known sources of false positives:
+
+      * A pop inside a loop whose wait sits outside it reads as unbalanced
+        while being correct at runtime. Flash attention ships that shape
+        (cb_id_internal3: 2 pops / 1 wait) and runs correctly on hardware.
+      * A CB passed into a helper is waited on there through the parameter
+        name, not its own. Mamba does exactly this -- binding4/binding5 are
+        popped at the call site and waited inside loom_unary_bcast_block_impl
+        -- so such CBs are skipped entirely rather than reported as unwaited.
+
+    Never gate compilation on these numbers; they say where to look, not what
+    is wrong.
     """
     text = "".join(lines)
     waits = collections.Counter(re.findall(r"cb_wait_front\(\s*([A-Za-z_][A-Za-z0-9_]*)", text))
     pops = collections.Counter(re.findall(r"cb_pop_front\(\s*([A-Za-z_][A-Za-z0-9_]*)", text))
     # Only named CB globals are checked; helper-function parameters (in_cb,
     # out_cb, cb_id, ...) are per-call aliases and cannot be reasoned about here.
-    names = {n for n in set(waits) | set(pops) if n.startswith("cb_id_")}
+    # A CB handed to a helper is waited on in there under the parameter's name,
+    # so its wait is invisible here. Counting it would report a pop with no
+    # wait for perfectly correct code, which is exactly how this check first
+    # mis-diagnosed mamba. Drop those CBs instead of guessing.
+    escaped = set(
+        re.findall(r"(?<!cb_wait_front)(?<!cb_pop_front)(?<!cb_reserve_back)"
+                   r"(?<!cb_push_back)\(\s*(cb_id_[A-Za-z0-9_]*)", text)
+    )
+    escaped |= set(re.findall(r",\s*(cb_id_[A-Za-z0-9_]*)", text))
+    names = {n for n in set(waits) | set(pops)
+             if n.startswith("cb_id_") and n not in escaped}
     errors, warnings = [], []
     for name in sorted(names):
         w, pcount = waits[name], pops[name]
