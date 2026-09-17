@@ -570,6 +570,79 @@ def _compact_compute_blocks(lines):
     return compacted, usage
 
 
+def _build_reader_congruence_helper():
+    """C++ shim that makes sub-tile DRAM reads satisfy Blackhole's NOC rule."""
+    return [
+        "\n",
+        "// tt-metal requires (l1_addr % A) == (dram_addr % A) for DRAM reads, where\n",
+        "// A = NOC_DRAM_READ_ALIGNMENT_BYTES: 64 on Blackhole, 32 on Wormhole. The\n",
+        "// sub-tile vector loads place 32-byte chunks whose DRAM offsets are 32 apart\n",
+        "// into L1 face slots 512 apart, so the two phases agree mod 32 but not mod 64\n",
+        "// and one read of every pair would be rejected by the NOC. Read the aligned\n",
+        "// 64-byte superset into the destination slot (itself 64B-aligned and at least\n",
+        "// 512B wide) and shift the wanted bytes down in place.\n",
+        "template <typename LoomAccessor>\n",
+        "inline void loom_read_congruent(const LoomAccessor &accessor, uint32_t page,\n",
+        "                                uint32_t offset, uint32_t l1_dst,\n",
+        "                                uint32_t len) {\n",
+        "  uint64_t src = accessor.get_noc_addr(page, offset);\n",
+        "  uint32_t src_phase = ((uint32_t) src) & 63u;\n",
+        "  uint32_t dst_phase = l1_dst & 63u;\n",
+        "  if (src_phase == dst_phase) {\n",
+        "    noc_async_read(src, l1_dst, len);\n",
+        "    return;\n",
+        "  }\n",
+        "  uint32_t span = (src_phase + len + 63u) & ~63u;\n",
+        "  uint32_t base_l1 = l1_dst - dst_phase;\n",
+        "  noc_async_read(src - src_phase, base_l1, span);\n",
+        "  noc_async_read_barrier();\n",
+        "  volatile uint8_t *from = (volatile uint8_t *) ((uintptr_t) base_l1);\n",
+        "  volatile uint8_t *to = (volatile uint8_t *) ((uintptr_t) l1_dst);\n",
+        "  for (uint32_t i = 0; i < len; i += 1) {\n",
+        "    to[i] = from[src_phase + i];\n",
+        "  }\n",
+        "}\n",
+        "\n",
+    ]
+
+
+_NOC_ADDR_DEF_RE = re.compile(
+    r"uint64_t (temp_\d+) = (\w+)\.get_noc_addr\(([^,]+), ([^)]+)\);"
+)
+_RAW_NOC_READ_RE = re.compile(r"noc_async_read\((temp_\d+), (\w+), (\w+)\);")
+
+
+def _apply_dram_read_congruence(lines):
+    """Route raw sub-tile DRAM reads through loom_read_congruent.
+
+    noc_async_read_tile is always page-aligned and needs nothing; only the
+    hand-rolled vector loads address sub-tile byte offsets and can therefore
+    land on a DRAM phase that disagrees with their L1 slot.
+    """
+    sites = {
+        m.group(1): (m.group(2), m.group(3), m.group(4))
+        for m in _NOC_ADDR_DEF_RE.finditer("".join(lines))
+    }
+    if not sites:
+        return lines, 0
+
+    rewritten = []
+    count = 0
+    for line in lines:
+        match = _RAW_NOC_READ_RE.search(line)
+        if match and match.group(1) in sites:
+            accessor, page, offset = sites[match.group(1)]
+            indent = line[: len(line) - len(line.lstrip())]
+            rewritten.append(
+                f"{indent}loom_read_congruent({accessor}, {page}, {offset}, "
+                f"{match.group(2)}, {match.group(3)});\n"
+            )
+            count += 1
+            continue
+        rewritten.append(line)
+    return rewritten, count
+
+
 def _build_compute_helper_block(usage):
     block = []
     block.append("\n")
@@ -810,6 +883,13 @@ def process_source_content(lines, section_name=None):
         section_name.startswith("host_cpp") or section_name == "host.cpp"
     ):
         processed = insert_include_if_missing(processed, "#include <vector>\n")
+
+    if section_name and section_name.startswith("reader"):
+        processed, congruent_reads = _apply_dram_read_congruence(processed)
+        if congruent_reads:
+            processed = insert_block_after_includes_if_missing(
+                processed, _build_reader_congruence_helper()
+            )
 
     if section_name and section_name.startswith("compute"):
         #it seems that math.h is not needed for compute kernels on blackhole machine
