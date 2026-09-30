@@ -296,6 +296,7 @@ static bool isSupportedElementwiseGeneric(linalg::GenericOp op) {
 
 static bool isSupportedFusedMulBcastAddGeneric(linalg::GenericOp op);
 static bool isSupportedInplaceBinaryBcastColsGeneric(linalg::GenericOp op);
+static bool destinationWrittenByPureProducer(linalg::GenericOp op);
 static bool isSupportedAddInplaceGeneric(linalg::GenericOp op);
 static bool isSupportedSimpleBinaryTileGeneric(linalg::GenericOp op);
 
@@ -326,7 +327,8 @@ classifyFlashAttentionGeneric(linalg::GenericOp op) {
   if (isSupportedAddInplaceGeneric(op))
     return FlashAttentionGenericKind::AddInplace;
 
-  if (isSupportedSimpleBinaryTileGeneric(op))
+  if (isSupportedSimpleBinaryTileGeneric(op) &&
+      !destinationWrittenByPureProducer(op))
     return FlashAttentionGenericKind::SimpleBinaryTile;
 
   if (isSupportedElementwiseGeneric(op))
@@ -886,8 +888,29 @@ static LogicalResult analyzeAddInplaceGeneric(linalg::GenericOp op,
   return success();
 }
 
+static bool destinationWrittenByPureProducer(linalg::GenericOp op) {
+  if (op.getNumDpsInits() != 1)
+    return false;
+  Value dest = op.getDpsInits()[0];
+  Block *block = op->getBlock();
+  if (!block)
+    return false;
+  for (Operation *prev = op->getPrevNode(); prev; prev = prev->getPrevNode()) {
+    auto dps = dyn_cast<DestinationStyleOpInterface>(prev);
+    if (!dps)
+      continue;
+    bool writes = llvm::is_contained(dps.getDpsInits(), dest);
+    if (!writes)
+      continue;
+    return !llvm::is_contained(dps.getDpsInputs(), dest);
+  }
+  return false;
+}
+
 static bool isSupportedAddInplaceGeneric(linalg::GenericOp op) {
   AddInplaceAnalysis analysis;
+  if (destinationWrittenByPureProducer(op))
+    return false;
   return succeeded(analyzeAddInplaceGeneric(op, analysis));
 }
 

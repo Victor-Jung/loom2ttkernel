@@ -619,16 +619,13 @@ def _apply_dram_read_congruence(lines):
     hand-rolled vector loads address sub-tile byte offsets and can therefore
     land on a DRAM phase that disagrees with their L1 slot.
     """
-    sites = {
-        m.group(1): (m.group(2), m.group(3), m.group(4))
-        for m in _NOC_ADDR_DEF_RE.finditer("".join(lines))
-    }
-    if not sites:
-        return lines, 0
 
     rewritten = []
     count = 0
+    sites = {}
     for line in lines:
+        for defn in _NOC_ADDR_DEF_RE.finditer(line):
+            sites[defn.group(1)] = (defn.group(2), defn.group(3), defn.group(4))
         match = _RAW_NOC_READ_RE.search(line)
         if match and match.group(1) in sites:
             accessor, page, offset = sites[match.group(1)]
