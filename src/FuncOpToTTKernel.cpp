@@ -2621,6 +2621,7 @@ private:
     parallelIvExprByValue.clear();
     mlirCoreExtentX = std::nullopt;
     mlirCoreExtentY = std::nullopt;
+    bool sawMappedParallel = false;
 
     hostFunc.walk([&](scf::ParallelOp op) {
       auto mappedDims = op->getAttrOfType<ArrayAttr>("loom.physical_dims");
@@ -2628,6 +2629,7 @@ private:
         mappedDims = op->getAttrOfType<ArrayAttr>("loom.mapped_to_dims");
       if (!mappedDims)
         return;
+      sawMappedParallel = true;
 
       auto iterTypes = op->getAttrOfType<ArrayAttr>("loom.iter_types");
       auto logicalLevels = op->getAttrOfType<ArrayAttr>("loom.logical_levels");
@@ -2786,6 +2788,15 @@ private:
       buildAxisIvExprs(xComponents, "core.x");
       buildAxisIvExprs(yComponents, "core.y");
     });
+
+    // A mapped loop fixes the core range; an axis it does not iterate over
+    // has extent 1.
+    if (sawMappedParallel) {
+      if (!mlirCoreExtentX)
+        mlirCoreExtentX = 1;
+      if (!mlirCoreExtentY)
+        mlirCoreExtentY = 1;
+    }
   }
   static FailureOr<std::string> buildTilesExpr(MemRefType memrefType,
                                                Location loc) {
