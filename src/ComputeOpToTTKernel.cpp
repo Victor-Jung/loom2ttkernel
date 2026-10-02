@@ -3291,19 +3291,12 @@ static void emitPackL1Prologue(
       }
       emitPackOverwriteMode(rewriter, loc, config.outCb);
 
+      // Every block after the first accumulates into L1. The packer flag is
+      // shared by all ops of the kernel, so it is set on each block rather
+      // than once on the second.
       rewriter.setInsertionPointToStart(&setupIf.getElseRegion().front());
-      Value isSecondBlock =
-          cmpBlockIv(rewriter, loc, *kLoopInfo, arith::CmpIPredicate::eq,
-                     kLoopInfo->lower + kLoopInfo->step);
-      scf::IfOp secondIf =
-          rewriter.create<scf::IfOp>(loc, isSecondBlock,
-                                     /*withElseRegion=*/false);
-      {
-        OpBuilder::InsertionGuard secondGuard(rewriter);
-        rewriter.setInsertionPointToStart(&secondIf.getThenRegion().front());
-        emitPackReconfigDataFormat(rewriter, loc, config.outCb);
-        emitPackReconfigL1Acc(rewriter, loc, 1);
-      }
+      emitPackReconfigDataFormat(rewriter, loc, config.outCb);
+      emitPackReconfigL1Acc(rewriter, loc, 1);
     }
     rewriter.setInsertionPointAfter(setupIf);
     return;
@@ -3463,6 +3456,10 @@ static LogicalResult lowerBatchMatmul(
   if (config.mode == BatchMatmulPackMode::PackL1) {
     kLoopInfo = getEnclosingStaticKSplitLoop(op);
     emitPackL1Prologue(config, kLoopInfo, totalOutTiles, rewriter);
+  } else {
+    // The packer flag is shared by all ops of the kernel; an overwriting
+    // matmul must clear it rather than rely on the power-on default.
+    emitPackOverwriteMode(rewriter, loc, config.outCb);
   }
 
   bool hasStreamAttr = op->hasAttr(kMatmulStreamOutputSubblocksAttrName);
