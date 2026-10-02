@@ -416,20 +416,35 @@ public:
       if (!isComputeKernelFunc(func))
         continue;
 
+      // The kernel-wide init comes from the first matmul; a kernel without
+      // one is initialised from its first binary elementwise op instead.
       Operation *targetMatmulOp = nullptr;
+      Operation *targetBinaryOp = nullptr;
       func.walk([&](Operation *op) {
         if (targetMatmulOp)
           return;
         if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, ::loom::MatmulOp,
-                ::loom::BatchMatmulOp>(op))
+                ::loom::BatchMatmulOp>(op)) {
           targetMatmulOp = op;
+          return;
+        }
+        if (targetBinaryOp)
+          return;
+        if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op))
+          if (linalgOp.getDpsInputs().size() >= 2 &&
+              !linalgOp.getDpsInits().empty())
+            targetBinaryOp = op;
       });
-      if (!targetMatmulOp)
+      Operation *targetInitOp = targetMatmulOp ? targetMatmulOp : targetBinaryOp;
+      if (!targetInitOp)
         continue;
 
-      bool hasMMInit = false;
-      func.walk([&](MatmulInitOp) { hasMMInit = true; });
-      if (hasMMInit)
+      bool hasInit = false;
+      func.walk([&](Operation *op) {
+        if (isa<MatmulInitOp, BinaryOpInitCommonOp>(op))
+          hasInit = true;
+      });
+      if (hasInit)
         continue;
 
       Block &entry = func.front();
@@ -529,7 +544,7 @@ public:
       }
 
       std::optional<MatmulLikeOperands> matmulOperands =
-          getMatmulLikeOperands(targetMatmulOp);
+          getMatmulLikeOperands(targetInitOp);
       if (!matmulOperands) {
         func.emitError()
             << "expected matmul-like op with two inputs and one output for mm_init";
@@ -602,9 +617,15 @@ public:
         return;
       }
 
-      Value transpose = builder.create<arith::ConstantIntOp>(func.getLoc(), 0, 32);
-      builder.create<MatmulInitOp>(func.getLoc(), *lhsCb, *rhsCb, *outputCb,
-                                   transpose);
+      if (targetMatmulOp) {
+        Value transpose =
+            builder.create<arith::ConstantIntOp>(func.getLoc(), 0, 32);
+        builder.create<MatmulInitOp>(func.getLoc(), *lhsCb, *rhsCb, *outputCb,
+                                     transpose);
+      } else {
+        builder.create<BinaryOpInitCommonOp>(func.getLoc(), *lhsCb, *rhsCb,
+                                             *outputCb);
+      }
     }
   }
 };
