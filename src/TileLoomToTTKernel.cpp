@@ -655,9 +655,11 @@ public:
           auto cbs = resolveOperands(candidate, /*quiet=*/true);
           if (!cbs)
             continue;
-          if (cbs->size() == 3)
+          // The init only configures the unpackers and the packer, so any
+          // two inputs and the output of a wider elementwise op serve.
+          if (cbs->size() >= 3)
             builder.create<BinaryOpInitCommonOp>(func.getLoc(), (*cbs)[0],
-                                                 (*cbs)[1], (*cbs)[2]);
+                                                 (*cbs)[1], cbs->back());
           else if (cbs->size() == 2)
             builder.create<UnaryOpInitCommonOp>(func.getLoc(), (*cbs)[0],
                                                 (*cbs)[1]);
