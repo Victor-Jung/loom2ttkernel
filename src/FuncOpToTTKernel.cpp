@@ -1049,9 +1049,13 @@ static void annotateSemaphoreSlots(func::FuncOp func) {
   });
 }
 
+/// Circular-buffer indices available on one Tensix core.
+static constexpr unsigned kMaxCircularBuffers = 32;
+
 static LogicalResult annotateStaticCbIndices(func::FuncOp func) {
   Builder builder(func.getContext());
   unsigned nextCbIndex = 0;
+  bool overflow = false;
   llvm::DenseMap<Value, unsigned> semaphoreToCbIndex;
 
   llvm::DenseMap<Value, SmallVector<Value, 4>> semaphoresByAlloc;
@@ -1069,6 +1073,12 @@ static LogicalResult annotateStaticCbIndices(func::FuncOp func) {
 
     for (Value semValue : it->second) {
       unsigned cbIndex = nextCbIndex++;
+      if (cbIndex >= kMaxCircularBuffers && !overflow) {
+        semValue.getDefiningOp()->emitError()
+            << "circular buffer index " << cbIndex << " exceeds the "
+            << kMaxCircularBuffers << " circular buffers of a core";
+        overflow = true;
+      }
       semaphoreToCbIndex[semValue] = cbIndex;
       if (auto sem = semValue.getDefiningOp<::loom::SemaphoreTakeOp>()) {
         sem->setAttr(kCBIndexAttrName, builder.getI64IntegerAttr(cbIndex));
@@ -1101,7 +1111,7 @@ static LogicalResult annotateStaticCbIndices(func::FuncOp func) {
     copyOp->setAttr(kCBIndexAttrName, builder.getI64IntegerAttr(it->second));
   });
 
-  return status;
+  return overflow ? failure() : status;
 }
 
 } // namespace
