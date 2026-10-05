@@ -141,9 +141,9 @@ static bool isReductionGenericWithoutScaleInput(linalg::GenericOp op) {
   auto iteratorTypes = op.getIteratorTypesArray();
   if (iteratorTypes.size() < 2)
     return false;
-  return iteratorTypes[iteratorTypes.size() - 1] ==
-             utils::IteratorType::reduction;
-   // && iteratorTypes[iteratorTypes.size() - 2] ==  utils::IteratorType::reduction;
+  return llvm::any_of(iteratorTypes, [](utils::IteratorType type) {
+    return type == utils::IteratorType::reduction;
+  });
 }
 
 static SymbolRefAttr findL1MemorySymbol(func::FuncOp func) {

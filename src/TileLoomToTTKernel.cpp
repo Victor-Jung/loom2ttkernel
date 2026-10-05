@@ -417,9 +417,11 @@ public:
         continue;
 
       // The kernel-wide init comes from the first matmul; a kernel without
-      // one is initialised from its first binary elementwise op instead.
+      // one is initialised from the first elementwise op whose operands
+      // resolve to circular buffers (binary: binary_op_init_common, unary:
+      // unary_op_init_common). Reductions carry their own init.
       Operation *targetMatmulOp = nullptr;
-      Operation *targetBinaryOp = nullptr;
+      SmallVector<Operation *, 8> elementwiseCandidates;
       func.walk([&](Operation *op) {
         if (targetMatmulOp)
           return;
@@ -428,17 +430,18 @@ public:
           targetMatmulOp = op;
           return;
         }
-        if (targetBinaryOp)
-          return;
-        if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op))
-          if (linalgOp.getDpsInputs().size() >= 2 &&
+        if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+          bool reduces = llvm::any_of(
+              linalgOp.getIteratorTypesArray(), [](utils::IteratorType t) {
+                return t == utils::IteratorType::reduction;
+              });
+          if (!reduces && !linalgOp.getDpsInputs().empty() &&
               !linalgOp.getDpsInits().empty())
-            targetBinaryOp = op;
+            elementwiseCandidates.push_back(op);
+        }
       });
-      Operation *targetInitOp = targetMatmulOp ? targetMatmulOp : targetBinaryOp;
-      if (!targetInitOp)
+      if (!targetMatmulOp && elementwiseCandidates.empty())
         continue;
-
       bool hasInit = false;
       func.walk([&](Operation *op) {
         if (isa<MatmulInitOp, BinaryOpInitCommonOp>(op))
@@ -543,15 +546,6 @@ public:
         bindingSlotToCB.try_emplace(slot, *cb);
       }
 
-      std::optional<MatmulLikeOperands> matmulOperands =
-          getMatmulLikeOperands(targetInitOp);
-      if (!matmulOperands) {
-        func.emitError()
-            << "expected matmul-like op with two inputs and one output for mm_init";
-        signalPassFailure();
-        return;
-      }
-
       OpBuilder builder(func.getContext());
       if (lastParamMaterialization)
         builder.setInsertionPointAfter(lastParamMaterialization);
@@ -563,8 +557,12 @@ public:
         FailureOr<std::pair<int64_t, MemRefType>> slotAndType =
             resolveInternalSemaphoreSlotAndType(operand);
         if (failed(slotAndType)) {
+          Operation *def = stripBindingLookupWrappers(operand).getDefiningOp();
           func.emitError() << "failed to resolve " << role
-                           << " internal semaphore CB for mm_init operand";
+                           << " internal semaphore CB for the compute init "
+                           << "(operand defined by "
+                           << (def ? def->getName().getStringRef() : "a block argument")
+                           << ")";
           return failure();
         }
 
@@ -592,6 +590,9 @@ public:
       auto resolveBindingCB = [&](Value operand,
                                   const llvm::DenseMap<Value, int64_t> &endpointToSlot,
                                   StringRef role) -> FailureOr<Value> {
+        // A broadcast result lives in the buffer the broadcast writes to.
+        if (auto bcast = operand.getDefiningOp<::loom::BroadcastOp>())
+          operand = bcast.getInit();
         Value endpoint = stripBindingLookupWrappers(operand);
         auto slotIt = endpointToSlot.find(endpoint);
         if (slotIt != endpointToSlot.end()) {
@@ -606,25 +607,71 @@ public:
         return getOrCreateInternalCb(endpoint, role);
       };
 
-      FailureOr<Value> lhsCb =
-          resolveBindingCB(matmulOperands->lhs, inputEndpointToSlot, "lhs input");
-      FailureOr<Value> rhsCb =
-          resolveBindingCB(matmulOperands->rhs, inputEndpointToSlot, "rhs input");
-      FailureOr<Value> outputCb =
-          resolveBindingCB(matmulOperands->out, outputEndpointToSlot, "output");
-      if (failed(lhsCb) || failed(rhsCb) || failed(outputCb)) {
-        signalPassFailure();
-        return;
-      }
+      // Resolve the init operands; for elementwise ops try the candidates in
+      // program order and take the first that resolves.
+      auto resolveOperands = [&](Operation *op, bool quiet)
+          -> std::optional<SmallVector<Value, 3>> {
+        auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+        SmallVector<Value, 3> operands;
+        if (auto mm = getMatmulLikeOperands(op); mm && !linalgOp) {
+          operands = {mm->lhs, mm->rhs, mm->out};
+        } else if (linalgOp) {
+          for (Value in : linalgOp.getDpsInputs())
+            operands.push_back(in);
+          operands.push_back(linalgOp.getDpsInits()[0]);
+        } else {
+          return std::nullopt;
+        }
+        SmallVector<Value, 3> cbs;
+        for (auto [idx, operand] : llvm::enumerate(operands)) {
+          if (!isa<MemRefType>(operand.getType()))
+            return std::nullopt; // scalar operand (e.g. linalg.fill value)
+          bool isOutput = idx + 1 == operands.size();
+          FailureOr<Value> cb = resolveBindingCB(
+              operand, isOutput ? outputEndpointToSlot : inputEndpointToSlot,
+              isOutput ? "output" : "input");
+          if (failed(cb))
+            return std::nullopt;
+          cbs.push_back(*cb);
+        }
+        (void)quiet;
+        return cbs;
+      };
 
       if (targetMatmulOp) {
+        auto cbs = resolveOperands(targetMatmulOp, /*quiet=*/false);
+        if (!cbs || cbs->size() != 3) {
+          func.emitError() << "failed to resolve the matmul operands for mm_init";
+          signalPassFailure();
+          return;
+        }
         Value transpose =
             builder.create<arith::ConstantIntOp>(func.getLoc(), 0, 32);
-        builder.create<MatmulInitOp>(func.getLoc(), *lhsCb, *rhsCb, *outputCb,
-                                     transpose);
+        builder.create<MatmulInitOp>(func.getLoc(), (*cbs)[0], (*cbs)[1],
+                                     (*cbs)[2], transpose);
       } else {
-        builder.create<BinaryOpInitCommonOp>(func.getLoc(), *lhsCb, *rhsCb,
-                                             *outputCb);
+        bool done = false;
+        for (Operation *candidate : elementwiseCandidates) {
+          auto cbs = resolveOperands(candidate, /*quiet=*/true);
+          if (!cbs)
+            continue;
+          if (cbs->size() == 3)
+            builder.create<BinaryOpInitCommonOp>(func.getLoc(), (*cbs)[0],
+                                                 (*cbs)[1], (*cbs)[2]);
+          else if (cbs->size() == 2)
+            builder.create<UnaryOpInitCommonOp>(func.getLoc(), (*cbs)[0],
+                                                (*cbs)[1]);
+          else
+            continue;
+          done = true;
+          break;
+        }
+        if (!done) {
+          func.emitError() << "no elementwise op with resolvable circular "
+                              "buffers to initialise the compute kernel from";
+          signalPassFailure();
+          return;
+        }
       }
     }
   }
