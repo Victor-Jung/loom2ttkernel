@@ -337,6 +337,29 @@ classifyFlashAttentionGeneric(linalg::GenericOp op) {
   return std::nullopt;
 }
 
+/// A reduction whose output buffer is initialised by a linalg.fill before an
+/// enclosing loop accumulates across that loop's iterations: each iteration
+/// must add onto the previous value and leave exactly one block in the CB.
+static bool isLoopCarriedReduction(linalg::GenericOp op) {
+  Value out = stripViewLikeWrappers(op.getDpsInits()[0]);
+  Operation *outDef = out ? out.getDefiningOp() : nullptr;
+  if (!outDef)
+    return false;
+  for (scf::ForOp loop = op->getParentOfType<scf::ForOp>(); loop;
+       loop = loop->getParentOfType<scf::ForOp>()) {
+    if (loop->isAncestor(outDef))
+      continue;
+    for (Operation *prev = loop->getPrevNode(); prev; prev = prev->getPrevNode()) {
+      if (auto fill = dyn_cast<linalg::FillOp>(prev))
+        if (fill.getOutputs().size() == 1 &&
+            stripViewLikeWrappers(fill.getOutputs()[0]) == out)
+          return true;
+    }
+    return false;
+  }
+  return false;
+}
+
 static LogicalResult rewriteReduceGeneric(linalg::GenericOp op,
                                           linalg::GenericOp::Adaptor adaptor,
                                           ConversionPatternRewriter &rewriter,
@@ -2643,7 +2666,15 @@ static LogicalResult rewriteReduceGeneric(linalg::GenericOp op,
     emitWaitFrontIfNeeded(rewriter, loc, inputCb, waitTiles, waitState);
   }
 
+  bool accumulates = isLoopCarriedReduction(op);
+  if (accumulates) {
+    // Consume the current value and re-acquire the same slot; the tiles are
+    // read back from it below before being overwritten.
+    CBWaitFrontOp::create(rewriter, loc, outCb, outTilesV);
+    CBPopFrontOp::create(rewriter, loc, outCb, outTilesV);
+  }
   CBReserveBackOp::create(rewriter, loc, outCb, outTilesV);
+  emitPackOverwriteMode(rewriter, loc, outCb);
   Value slabTilesV = i32Const(rewriter, loc, rows * cols);
   Value outPerBatchV = i32Const(rewriter, loc, outPerBatch);
   Value reducePerOutV = i32Const(rewriter, loc, reducePerOut);
@@ -2660,6 +2691,12 @@ static LogicalResult rewriteReduceGeneric(linalg::GenericOp op,
     Value slabBase = rewriter.create<arith::MulIOp>(loc, batchIdx, slabTilesV);
 
     TileRegsAcquireOp::create(rewriter, loc);
+    if (accumulates) {
+      // Start from the previous partial result so the reduce accumulates
+      // onto it in DST.
+      rewriter.create<CopyTileInitOp>(loc, outCb);
+      rewriter.create<CopyTileOp>(loc, outCb, outIdx, zeroI32);
+    }
     rewriter.create<ReduceInitOp>(loc, inCb, scaleCb, outCb, reduceType,
                                   reduceDim);
 
