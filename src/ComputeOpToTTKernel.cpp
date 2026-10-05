@@ -4245,6 +4245,9 @@ public:
 
     CBWaitFrontOp::create(rewriter, loc, inCb, totalTiles);
     CBReserveBackOp::create(rewriter, loc, outCb, totalTiles);
+    // The packer flag is shared by all ops of the kernel; a transpose inside
+    // an accumulation loop must not inherit the matmul's accumulate mode.
+    emitPackOverwriteMode(rewriter, loc, outCb);
     rewriter.create<TransposeInitOp>(loc, tileInCb, tileOutCb);
 
     scf::ForOp wtLoop =
