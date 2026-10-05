@@ -2578,26 +2578,54 @@ static LogicalResult rewriteReduceGeneric(linalg::GenericOp op,
   auto inType = dyn_cast<ShapedType>(op.getDpsInputs()[0].getType());
   auto outType = dyn_cast<ShapedType>(op.getDpsInits()[0].getType());
   if (!inType || !outType || !inType.hasStaticShape() ||
-      !outType.hasStaticShape() || inType.getRank() != 3)
-    return failure();
-  if (outType.getRank() != 2 && outType.getRank() != 3)
-    return failure();
-  if (outType.getRank() == 3 && outType.getShape()[2] != 1)
+      !outType.hasStaticShape() || inType.getRank() < 2)
     return failure();
 
-  // Rank-3 reduction input uses [batch, m, n] where batch is already
-  // tile-domain multiplicity (not an element-domain extent).
-  int64_t bTiles = inType.getShape()[0];
-  auto mTiles = getTileDim(inType, 1);
-  auto nTiles = getTileDim(inType, 2);
+  // Exactly one reduced dimension, and it must be one of the two tiled
+  // (trailing) dimensions: the last one is a row reduction, the one before
+  // it a column reduction. Leading dimensions are tile-domain multiplicity.
+  unsigned inRank = inType.getRank();
+  auto iteratorTypes = op.getIteratorTypesArray();
+  if (iteratorTypes.size() != inRank)
+    return failure();
+  std::optional<unsigned> reducedDim;
+  for (unsigned dim = 0; dim < inRank; ++dim) {
+    if (iteratorTypes[dim] != utils::IteratorType::reduction)
+      continue;
+    if (reducedDim)
+      return op.emitOpError() << "reduction over more than one dimension";
+    reducedDim = dim;
+  }
+  if (!reducedDim || *reducedDim + 2 < inRank)
+    return op.emitOpError()
+           << "reduction must be over one of the two tiled dimensions";
+  ReduceDim reduceDim =
+      *reducedDim == inRank - 1 ? ReduceDim::Row : ReduceDim::Col;
+
+  unsigned outRank = outType.getRank();
+  if (outRank != inRank && outRank + 1 != inRank)
+    return failure();
+  if (outRank == inRank && outType.getShape()[*reducedDim] != 1)
+    return failure();
+
+  int64_t batch = 1;
+  for (unsigned dim = 0; dim + 2 < inRank; ++dim)
+    batch *= inType.getShape()[dim];
+  auto mTiles = getTileDim(inType, inRank - 2);
+  auto nTiles = getTileDim(inType, inRank - 1);
   auto outTiles = getNumTilesFromShapedType(outType);
-  if (bTiles <= 0 || !mTiles || !nTiles || !outTiles)
+  if (batch <= 0 || !mTiles || !nTiles || !outTiles)
     return failure();
 
-  int64_t rows = bTiles * (*mTiles);
+  // Tiles of one batch slab are laid out row-major as [mTiles x nTiles].
+  // A row reduction produces one tile per (batch, row), a column reduction
+  // one tile per (batch, column).
+  int64_t rows = *mTiles;
   int64_t cols = *nTiles;
-  int64_t numTiles = rows * cols;
-  if (*outTiles != rows)
+  int64_t numTiles = batch * rows * cols;
+  int64_t outPerBatch = reduceDim == ReduceDim::Row ? rows : cols;
+  int64_t reducePerOut = reduceDim == ReduceDim::Row ? cols : rows;
+  if (*outTiles != batch * outPerBatch)
     return failure();
 
   Location loc = op.getLoc();
@@ -2616,41 +2644,48 @@ static LogicalResult rewriteReduceGeneric(linalg::GenericOp op,
   }
 
   CBReserveBackOp::create(rewriter, loc, outCb, outTilesV);
-  Value rowsV = i32Const(rewriter, loc, rows);
+  Value slabTilesV = i32Const(rewriter, loc, rows * cols);
+  Value outPerBatchV = i32Const(rewriter, loc, outPerBatch);
+  Value reducePerOutV = i32Const(rewriter, loc, reducePerOut);
   Value colsV = i32Const(rewriter, loc, cols);
-  scf::ForOp rowLoop =
-      scf::ForOp::create(rewriter, loc, zeroI32, rowsV, oneI32);
+  scf::ForOp outLoop =
+      scf::ForOp::create(rewriter, loc, zeroI32, outTilesV, oneI32);
   {
     OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(rowLoop.getBody());
+    rewriter.setInsertionPointToStart(outLoop.getBody());
 
-    Value rowIdx = rowLoop.getInductionVar();
+    Value outIdx = outLoop.getInductionVar();
+    Value batchIdx = rewriter.create<arith::DivUIOp>(loc, outIdx, outPerBatchV);
+    Value lane = rewriter.create<arith::RemUIOp>(loc, outIdx, outPerBatchV);
+    Value slabBase = rewriter.create<arith::MulIOp>(loc, batchIdx, slabTilesV);
+
     TileRegsAcquireOp::create(rewriter, loc);
     rewriter.create<ReduceInitOp>(loc, inCb, scaleCb, outCb, reduceType,
-                                  ReduceDim::Row);
+                                  reduceDim);
 
-    Value rowOffset = rewriter.create<arith::MulIOp>(loc, rowIdx, colsV);
-    scf::ForOp colLoop =
-        scf::ForOp::create(rewriter, loc, zeroI32, colsV, oneI32);
+    scf::ForOp reduceLoop =
+        scf::ForOp::create(rewriter, loc, zeroI32, reducePerOutV, oneI32);
     {
       OpBuilder::InsertionGuard innerGuard(rewriter);
-      rewriter.setInsertionPointToStart(colLoop.getBody());
-      Value colIdx = colLoop.getInductionVar();
-      Value inTile = rewriter.create<arith::AddIOp>(loc, rowOffset, colIdx);
+      rewriter.setInsertionPointToStart(reduceLoop.getBody());
+      Value k = reduceLoop.getInductionVar();
+      // Row: tile (lane, k); Col: tile (k, lane).
+      Value rowIdx = reduceDim == ReduceDim::Row ? lane : k;
+      Value colIdx = reduceDim == ReduceDim::Row ? k : lane;
+      Value rowOffset = rewriter.create<arith::MulIOp>(loc, rowIdx, colsV);
+      Value inSlab = rewriter.create<arith::AddIOp>(loc, rowOffset, colIdx);
+      Value inTile = rewriter.create<arith::AddIOp>(loc, slabBase, inSlab);
       rewriter.create<ReduceTileOp>(loc, inCb, scaleCb, inTile, zeroI32,
-                                    zeroI32, reduceType, ReduceDim::Row);
+                                    zeroI32, reduceType, reduceDim);
     }
 
-    rewriter.setInsertionPointAfter(colLoop);
+    rewriter.setInsertionPointAfter(reduceLoop);
     rewriter.create<ReduceUninitOp>(loc);
     TileRegsCommitOp::create(rewriter, loc);
     TileRegsWaitOp::create(rewriter, loc);
-    PackTileOp::create(rewriter, loc, zeroI32, outCb, rowIdx);
+    PackTileOp::create(rewriter, loc, zeroI32, outCb, outIdx);
     TileRegsReleaseOp::create(rewriter, loc);
   }
-  //TODO: add pop first, since current output also works as input
-  //CBPopFrontOp::create(rewriter, loc, outCb, outTilesV);
-  //CBReserveBackOp::create(rewriter, loc, outCb, outTilesV);
   CBPushBackOp::create(rewriter, loc, outCb, outTilesV);
   waitState[outCb] = 0;
 
