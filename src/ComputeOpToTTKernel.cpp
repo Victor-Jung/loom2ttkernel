@@ -106,6 +106,7 @@ struct ElementwiseAnalysis {
   bool needsRecip = false;
   bool needsLog = false;
   bool needsExp = false;
+  bool needsRsqrt = false;
 };
 
 static std::optional<int64_t> getAnnotatedVecTilesFromInput(Value value) {
@@ -706,7 +707,8 @@ enum class SimpleBinaryTileKind {
 
 enum class SimpleBinaryTileUnaryKind {
   Exp,
-  Log
+  Log,
+  Rsqrt
 };
 
 struct SimpleBinaryTileAnalysis {
@@ -748,6 +750,13 @@ static LogicalResult analyzeSimpleBinaryExpr(
       unaryTail.push_back(SimpleBinaryTileUnaryKind::Log);
       expectedOps.push_back(defOp);
       binaryValue = logOp.getOperand();
+      continue;
+    }
+
+    if (auto rsqrtOp = dyn_cast<math::RsqrtOp>(defOp)) {
+      unaryTail.push_back(SimpleBinaryTileUnaryKind::Rsqrt);
+      expectedOps.push_back(defOp);
+      binaryValue = rsqrtOp.getOperand();
       continue;
     }
 
@@ -1888,6 +1897,7 @@ enum class GenericExprFeature {
   Recip,
   Log,
   Exp,
+  Rsqrt,
   Fill
 };
 
@@ -1967,6 +1977,11 @@ static LogicalResult analyzeGenericExprTree(
     if (auto logOp = dyn_cast<math::LogOp>(defOp)) {
       setFlag(GenericExprFeature::Log);
       return self(self, logOp.getOperand());
+    }
+
+    if (auto rsqrtOp = dyn_cast<math::RsqrtOp>(defOp)) {
+      setFlag(GenericExprFeature::Rsqrt);
+      return self(self, rsqrtOp.getOperand());
     }
 
     if (auto expOp = dyn_cast<math::ExpOp>(defOp)) {
@@ -2279,6 +2294,16 @@ static LogicalResult emitGenericExprToRegImpl(
       return success();
     }
 
+    if (auto rsqrtOp = dyn_cast<math::RsqrtOp>(defOp)) {
+      if (failed(self(self, rsqrtOp.getOperand(), curDstReg, curTmpRegA,
+                      curTmpRegB)))
+        return failure();
+      if (emitInlineInitOps)
+        rewriter.create<RsqrtTileInitOp>(loc);
+      rewriter.create<RsqrtTileOp>(loc, curDstRegVal);
+      return success();
+    }
+
     if (auto expOp = dyn_cast<math::ExpOp>(defOp)) {
       if (failed(self(self, expOp.getOperand(), curDstReg, curTmpRegA,
                       curTmpRegB)))
@@ -2365,6 +2390,9 @@ static LogicalResult analyzeElementwiseExpr(Value exprValue, linalg::GenericOp o
       return;
     case GenericExprFeature::Log:
       analysis.needsLog = true;
+      return;
+    case GenericExprFeature::Rsqrt:
+      analysis.needsRsqrt = true;
       return;
     case GenericExprFeature::Exp:
       analysis.needsExp = true;
@@ -2751,6 +2779,9 @@ static void emitSimpleBinaryTileUnaryInit(ConversionPatternRewriter &rewriter,
   case SimpleBinaryTileUnaryKind::Log:
     rewriter.create<LogTileInitOp>(loc);
     return;
+  case SimpleBinaryTileUnaryKind::Rsqrt:
+    rewriter.create<RsqrtTileInitOp>(loc);
+    return;
   }
 }
 
@@ -2764,6 +2795,9 @@ static void emitSimpleBinaryTileUnaryOp(ConversionPatternRewriter &rewriter,
     return;
   case SimpleBinaryTileUnaryKind::Log:
     rewriter.create<LogTileOp>(loc, dstReg);
+    return;
+  case SimpleBinaryTileUnaryKind::Rsqrt:
+    rewriter.create<RsqrtTileOp>(loc, dstReg);
     return;
   }
 }
@@ -3263,6 +3297,8 @@ static LogicalResult rewriteElementwiseGeneric(linalg::GenericOp op,
     rewriter.create<LogTileInitOp>(loc);
   if (analysis.needsExp)
     rewriter.create<ExpTileInitOp>(loc);
+  if (analysis.needsRsqrt)
+    rewriter.create<RsqrtTileInitOp>(loc);
 
   LogicalResult result = emitElementwiseTiles(
       rewriter, loc, outCb, analysis.outTiles, [&](Value tileIdx) -> LogicalResult {
