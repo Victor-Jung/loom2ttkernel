@@ -1705,9 +1705,37 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
         tracker(std::move(tracker)),
         matmulMergeBReaderIntoWriter(matmulMergeBReaderIntoWriter) {}
 
+  /// A predicated store (`loom.copy ... if %p`) keeps its buffer protocol
+  /// (wait, barrier, pop) and skips only the NoC writes when %p is false.
   LogicalResult
   matchAndRewrite(::loom::CopyOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    Value predicate = adaptor.getPredicate();
+    Block *block = op->getBlock();
+    Operation *prev = op->getPrevNode();
+    if (failed(matchAndRewriteStore(op, adaptor, rewriter)))
+      return failure();
+    if (!predicate)
+      return success();
+    SmallVector<Operation *> writes;
+    for (auto it = prev ? std::next(prev->getIterator()) : block->begin();
+         it != block->end() && &*it != op.getOperation(); ++it)
+      it->walk([&](Operation *inner) {
+        if (isa<NocAsyncWriteTileOp, NocAsyncWriteOp>(inner))
+          writes.push_back(inner);
+      });
+    for (Operation *write : writes) {
+      rewriter.setInsertionPoint(write);
+      auto ifOp = scf::IfOp::create(rewriter, write->getLoc(), predicate,
+                                    /*withElseRegion=*/false);
+      rewriter.moveOpBefore(write, ifOp.thenBlock()->getTerminator());
+    }
+    return success();
+  }
+
+  LogicalResult
+  matchAndRewriteStore(::loom::CopyOp op, OpAdaptor adaptor,
+                       ConversionPatternRewriter &rewriter) const {
     // Store: destination is a reinterpret_cast.
     Value target = op.getDestination();
     auto reinterpretCastOp = target.getDefiningOp<memref::ReinterpretCastOp>();
