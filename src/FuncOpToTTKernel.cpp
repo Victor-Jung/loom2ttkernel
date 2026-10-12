@@ -141,6 +141,15 @@ static bool isReductionGenericWithoutScaleInput(linalg::GenericOp op) {
   auto iteratorTypes = op.getIteratorTypesArray();
   if (iteratorTypes.size() < 2)
     return false;
+  // A reduction over the leading (non-tile) dim only, e.g. the merge of
+  // gathered partials, is an element-wise accumulation of whole tiles and
+  // takes no scaler: [reduction, parallel, parallel, ...].
+  if (iteratorTypes.size() >= 3 &&
+      iteratorTypes[0] == utils::IteratorType::reduction &&
+      llvm::all_of(llvm::drop_begin(iteratorTypes), [](utils::IteratorType t) {
+        return t == utils::IteratorType::parallel;
+      }))
+    return false;
   return llvm::any_of(iteratorTypes, [](utils::IteratorType type) {
     return type == utils::IteratorType::reduction;
   });
