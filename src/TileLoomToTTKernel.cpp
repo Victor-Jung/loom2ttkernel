@@ -710,6 +710,19 @@ public:
             llvm::cl::desc(
                 "For matmul, stream output subblocks from compute to writer"),
             llvm::cl::init(false)),
+        fpuElementwise(
+            *this, "fpu-elementwise",
+            llvm::cl::desc(
+                "Fold broadcasts that only feed elementwise ops into them and "
+                "lower add/sub/mul of two inputs to FPU tile ops"),
+            llvm::cl::init(true)),
+        dramBatchTiles(
+            *this, "dram-batch-tiles",
+            llvm::cl::desc(
+                "DRAM tiles a reader or writer issues between NoC barriers "
+                "(0: one barrier per transfer, -1: a heuristic on the core "
+                "count)"),
+            llvm::cl::init(-1)),
         reduceProtocolOpt(
             *this, "reduce-protocol",
             llvm::cl::desc("Reduce synchronization protocol "
@@ -739,6 +752,19 @@ public:
             llvm::cl::desc(
                 "For matmul, stream output subblocks from compute to writer"),
             llvm::cl::init(false)),
+        fpuElementwise(
+            *this, "fpu-elementwise",
+            llvm::cl::desc(
+                "Fold broadcasts that only feed elementwise ops into them and "
+                "lower add/sub/mul of two inputs to FPU tile ops"),
+            llvm::cl::init(true)),
+        dramBatchTiles(
+            *this, "dram-batch-tiles",
+            llvm::cl::desc(
+                "DRAM tiles a reader or writer issues between NoC barriers "
+                "(0: one barrier per transfer, -1: a heuristic on the core "
+                "count)"),
+            llvm::cl::init(-1)),
         reduceProtocolOpt(
             *this, "reduce-protocol",
             llvm::cl::desc("Reduce synchronization protocol "
@@ -754,6 +780,8 @@ public:
         static_cast<bool>(other.matmulSplitHalfDataMovementCores);
     matmulStreamOutputSubblocks =
         static_cast<bool>(other.matmulStreamOutputSubblocks);
+    fpuElementwise = static_cast<bool>(other.fpuElementwise);
+    dramBatchTiles = static_cast<int64_t>(other.dramBatchTiles);
     reduceProtocolOpt = other.reduceProtocolOpt;
     reduceProtocolDeprecated = other.reduceProtocolDeprecated;
   }
@@ -783,6 +811,8 @@ public:
   Option<bool> matmulMergeBReaderIntoWriter;
   Option<bool> matmulSplitHalfDataMovementCores;
   Option<bool> matmulStreamOutputSubblocks;
+  Option<bool> fpuElementwise;
+  Option<int64_t> dramBatchTiles;
   Option<std::string> reduceProtocolOpt;
   /// @deprecated Use reduce-protocol instead.
   Option<std::string> reduceProtocolDeprecated;
@@ -862,6 +892,15 @@ public:
     //
     // This must run before MemoryOp/ComputeOp lowering so each specialized
     // function is lowered independently.
+    if (fpuElementwise) {
+      module->setAttr(kFpuElementwiseAttrName, UnitAttr::get(&getContext()));
+      foldMaterializedBroadcasts(module);
+    }
+    if (dramBatchTiles >= 0)
+      module->setAttr(kDramBatchTilesAttrName,
+                      IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                                       static_cast<int64_t>(dramBatchTiles)));
+
     if (matmulMergeBReaderIntoWriter) {
       if (failed(prepareMatmulBReaderMerge(module))) {
         signalPassFailure();
@@ -1113,6 +1152,8 @@ public:
     // Mapping metadata on loop shells is no longer needed after lowering and
     // leaks unregistered Loom attrs into TT-facing pipelines.
     eraseLoomLoopAttrs(module);
+    module->removeAttr(kFpuElementwiseAttrName);
+    module->removeAttr(kDramBatchTilesAttrName);
 
     // Post-conversion: Remove all function arguments.
     // After conversion, memref args used in reinterpret_cast should be dead

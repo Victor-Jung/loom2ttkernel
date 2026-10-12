@@ -43,6 +43,19 @@ inline constexpr llvm::StringLiteral kBroadcastDimAttrName =
     "loom.ttkernel.broadcast_dim";
 inline constexpr llvm::StringLiteral kFusedBcastColsAttrName =
     "loom.ttkernel.fused_bcast_cols";
+/// On a linalg.generic: per input, the output dimension a folded loom.broadcast
+/// expanded (-1 for inputs read as they are). Set by
+/// foldMaterializedBroadcasts.
+inline constexpr llvm::StringLiteral kFoldedBroadcastDimsAttrName =
+    "loom.ttkernel.folded_broadcast_dims";
+/// On the module: lower elementwise add/sub/mul of two generic inputs to FPU
+/// tile ops.
+inline constexpr llvm::StringLiteral kFpuElementwiseAttrName =
+    "loom.ttkernel.fpu_elementwise";
+/// On the module: DRAM tiles a reader or writer issues between NoC barriers
+/// (0: one barrier per transfer). Absent: a heuristic on the core count.
+inline constexpr llvm::StringLiteral kDramBatchTilesAttrName =
+    "loom.ttkernel.dram_batch_tiles";
 inline constexpr llvm::StringLiteral kSemaphoreSlotAttrName =
     "loom.ttkernel.semaphore_slot";
 inline constexpr llvm::StringLiteral kCopyBindingSlotAttrName =

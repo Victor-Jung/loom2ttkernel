@@ -88,6 +88,9 @@ struct ElementwiseBroadcastInfo {
   int64_t droppedDimTiles = 1;
   /// Product of tile-count extents after @p droppedDim.
   int64_t suffixTiles = 1;
+  /// Set for a folded broadcast within the tile (row or column): the input
+  /// only enters FPU tile ops as their broadcast operand.
+  std::optional<BcastType> tileBcast;
 };
 
 struct ElementwiseAnalysis {
@@ -1945,6 +1948,12 @@ static LogicalResult analyzeGenericExprTree(
     }
 
     if (auto addOp = dyn_cast<arith::AddFOp>(defOp)) {
+      auto lhsConst = getConstFloatValue(addOp.getLhs());
+      auto rhsConst = getConstFloatValue(addOp.getRhs());
+      if (lhsConst.has_value() != rhsConst.has_value()) {
+        setFlag(GenericExprFeature::BinopWithScalar);
+        return self(self, lhsConst ? addOp.getRhs() : addOp.getLhs());
+      }
       setFlag(GenericExprFeature::AddBinary);
       if (failed(self(self, addOp.getLhs())))
         return failure();
@@ -1952,6 +1961,11 @@ static LogicalResult analyzeGenericExprTree(
     }
 
     if (auto subOp = dyn_cast<arith::SubFOp>(defOp)) {
+      if (getConstFloatValue(subOp.getRhs()) &&
+          !getConstFloatValue(subOp.getLhs())) {
+        setFlag(GenericExprFeature::BinopWithScalar);
+        return self(self, subOp.getLhs());
+      }
       setFlag(GenericExprFeature::SubBinary);
       if (failed(self(self, subOp.getLhs())))
         return failure();
@@ -2116,7 +2130,9 @@ static LogicalResult emitGenericExprToRegImpl(
     linalg::GenericOp::Adaptor adaptor, ConversionPatternRewriter &rewriter,
     Location loc, bool emitInlineInitOps, bool allowMaximumFOp,
     LeafEmitterT &&emitLeafToReg, RhsFirstPolicyT &&emitRhsFirstForOperands,
-    RuntimeScalarLookupT &&lookupRuntimeScalarBits) {
+    RuntimeScalarLookupT &&lookupRuntimeScalarBits,
+    llvm::function_ref<LogicalResult(Operation *, int, bool &)>
+        emitFpuBinaryToReg) {
   auto recurse =
       [&](auto &&self, Value value, int curDstReg, int curTmpRegA,
           int curTmpRegB) -> LogicalResult {
@@ -2141,6 +2157,14 @@ static LogicalResult emitGenericExprToRegImpl(
     Operation *defOp = value.getDefiningOp();
     if (!defOp || defOp->getBlock() != &op.getRegion().front())
       return failure();
+
+    // add/sub/mul of two inputs: one FPU op unpacks both straight from CBs.
+    auto tryFpuBinary = [&](bool &handled) -> LogicalResult {
+      handled = false;
+      if (!emitFpuBinaryToReg)
+        return success();
+      return emitFpuBinaryToReg(defOp, curDstReg, handled);
+    };
 
     if (auto mulOp = dyn_cast<arith::MulFOp>(defOp)) {
       auto lhsConst = getConstFloatValue(mulOp.getLhs());
@@ -2184,6 +2208,12 @@ static LogicalResult emitGenericExprToRegImpl(
       if (lhsRuntimeScalar && rhsRuntimeScalar)
         return failure();
 
+      bool fpuHandled = false;
+      if (failed(tryFpuBinary(fpuHandled)))
+        return failure();
+      if (fpuHandled)
+        return success();
+
       bool emitRhsFirst = emitRhsFirstForOperands(mulOp.getLhs(), mulOp.getRhs());
       if (emitRhsFirst) {
         if (failed(self(self, mulOp.getRhs(), curTmpRegA, curTmpRegB, curDstReg)))
@@ -2204,6 +2234,25 @@ static LogicalResult emitGenericExprToRegImpl(
     }
 
     if (auto addOp = dyn_cast<arith::AddFOp>(defOp)) {
+      auto lhsConst = getConstFloatValue(addOp.getLhs());
+      auto rhsConst = getConstFloatValue(addOp.getRhs());
+      if (lhsConst.has_value() != rhsConst.has_value()) {
+        if (failed(self(self, lhsConst ? addOp.getRhs() : addOp.getLhs(),
+                        curDstReg, curTmpRegA, curTmpRegB)))
+          return failure();
+        if (emitInlineInitOps)
+          rewriter.create<BinopWithScalarTileInitOp>(loc);
+        rewriter.create<AddUnaryTileOp>(
+            loc, curDstRegVal,
+            getScalarBitsFromFloat(rewriter, loc,
+                                   lhsConst ? *lhsConst : *rhsConst));
+        return success();
+      }
+      bool fpuHandled = false;
+      if (failed(tryFpuBinary(fpuHandled)))
+        return failure();
+      if (fpuHandled)
+        return success();
       bool emitRhsFirst = emitRhsFirstForOperands(addOp.getLhs(), addOp.getRhs());
       if (emitRhsFirst) {
         if (failed(self(self, addOp.getRhs(), curTmpRegA, curTmpRegB, curDstReg)))
@@ -2224,6 +2273,22 @@ static LogicalResult emitGenericExprToRegImpl(
     }
 
     if (auto subOp = dyn_cast<arith::SubFOp>(defOp)) {
+      auto rhsConst = getConstFloatValue(subOp.getRhs());
+      if (rhsConst && !getConstFloatValue(subOp.getLhs())) {
+        if (failed(self(self, subOp.getLhs(), curDstReg, curTmpRegA,
+                        curTmpRegB)))
+          return failure();
+        if (emitInlineInitOps)
+          rewriter.create<BinopWithScalarTileInitOp>(loc);
+        rewriter.create<SubUnaryTileOp>(
+            loc, curDstRegVal, getScalarBitsFromFloat(rewriter, loc, *rhsConst));
+        return success();
+      }
+      bool fpuHandled = false;
+      if (failed(tryFpuBinary(fpuHandled)))
+        return failure();
+      if (fpuHandled)
+        return success();
       bool emitRhsFirst = emitRhsFirstForOperands(subOp.getLhs(), subOp.getRhs());
       if (emitRhsFirst) {
         if (failed(self(self, subOp.getRhs(), curTmpRegA, curTmpRegB, curDstReg)))
@@ -2428,6 +2493,32 @@ static LogicalResult analyzeElementwiseGeneric(linalg::GenericOp op,
   unsigned numInputs = op.getNumDpsInputs();
   analysis.broadcastsByInput.assign(numInputs, std::nullopt);
 
+  SmallVector<int64_t, 4> foldedDims(numInputs, -1);
+  if (auto attr =
+          op->getAttrOfType<DenseI64ArrayAttr>(kFoldedBroadcastDimsAttrName)) {
+    if (attr.size() != static_cast<int64_t>(numInputs))
+      return failure();
+    llvm::copy(attr.asArrayRef(), foldedDims.begin());
+  }
+  for (unsigned i = 0; i < numInputs; ++i) {
+    if (foldedDims[i] < 0)
+      continue;
+    if (foldedDims[i] >= static_cast<int64_t>(rank))
+      return failure();
+    unsigned dim = static_cast<unsigned>(foldedDims[i]);
+    auto suffixTiles = getSuffixTilesAfterDim(outTileShape, dim);
+    if (!suffixTiles || *suffixTiles <= 0 || outTileShape[dim] <= 0)
+      return failure();
+    ElementwiseBroadcastInfo info;
+    info.inputIdx = i;
+    info.droppedDim = dim;
+    info.kind = classifyElementwiseBroadcastKind(dim, rank);
+    info.droppedDimTiles = outTileShape[dim];
+    info.suffixTiles = *suffixTiles;
+    info.tileBcast = getUnaryBcastType(info.kind);
+    analysis.broadcastsByInput[i] = info;
+  }
+
   bool allIdentity = hasAllIdentityMapsForRank(op, rank);
   if (!allIdentity) {
     auto maps = op.getIndexingMapsArray();
@@ -2437,7 +2528,7 @@ static LogicalResult analyzeElementwiseGeneric(linalg::GenericOp op,
       return failure();
 
     for (unsigned i = 0; i < numInputs; ++i) {
-      if (isIdentityMapForRank(maps[i], rank))
+      if (isIdentityMapForRank(maps[i], rank) || foldedDims[i] >= 0)
         continue;
 
       ElementwiseBroadcastInfo info;
@@ -2554,12 +2645,224 @@ static LogicalResult analyzeElementwiseGeneric(linalg::GenericOp op,
   return success();
 }
 
+enum class FpuBinaryKind { Add, Sub, Mul };
+
+/// An add, sub or mul of two generic inputs, run as one FPU tile op that
+/// unpacks both operands from their CBs. @p bcast is set when the second
+/// operand is a folded in-tile broadcast.
+struct FpuBinarySpec {
+  FpuBinaryKind kind = FpuBinaryKind::Add;
+  unsigned lhsInput = 0;
+  unsigned rhsInput = 0;
+  std::optional<BcastType> bcast;
+
+  bool operator==(const FpuBinarySpec &other) const {
+    return kind == other.kind && lhsInput == other.lhsInput &&
+           rhsInput == other.rhsInput && bcast == other.bcast;
+  }
+};
+
+static bool isFpuElementwiseEnabled(Operation *op) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (parent->hasAttr(kFpuElementwiseAttrName))
+      return true;
+  return false;
+}
+
+/// Matches @p defOp as an FPU binary op. In-tile broadcast inputs must be the
+/// second operand (add and mul commute); sub has no short init for a row
+/// broadcast.
+static std::optional<FpuBinarySpec>
+matchFpuBinary(Operation *defOp, linalg::GenericOp op,
+               ArrayRef<std::optional<BcastType>> tileBcastByInput,
+               ArrayRef<std::optional<Value>> runtimeScalarBitsByInput) {
+  FpuBinarySpec spec;
+  Value lhs;
+  Value rhs;
+  if (auto addOp = dyn_cast<arith::AddFOp>(defOp)) {
+    spec.kind = FpuBinaryKind::Add;
+    lhs = addOp.getLhs();
+    rhs = addOp.getRhs();
+  } else if (auto subOp = dyn_cast<arith::SubFOp>(defOp)) {
+    spec.kind = FpuBinaryKind::Sub;
+    lhs = subOp.getLhs();
+    rhs = subOp.getRhs();
+  } else if (auto mulOp = dyn_cast<arith::MulFOp>(defOp)) {
+    spec.kind = FpuBinaryKind::Mul;
+    lhs = mulOp.getLhs();
+    rhs = mulOp.getRhs();
+  } else {
+    return std::nullopt;
+  }
+  auto lhsIdx = getBodyInputIndex(op, lhs);
+  auto rhsIdx = getBodyInputIndex(op, rhs);
+  if (!lhsIdx || !rhsIdx)
+    return std::nullopt;
+  auto isRuntimeScalar = [&](unsigned idx) {
+    return idx < runtimeScalarBitsByInput.size() &&
+           runtimeScalarBitsByInput[idx].has_value();
+  };
+  if (isRuntimeScalar(*lhsIdx) || isRuntimeScalar(*rhsIdx))
+    return std::nullopt;
+  auto bcastOf = [&](unsigned idx) -> std::optional<BcastType> {
+    return idx < tileBcastByInput.size() ? tileBcastByInput[idx] : std::nullopt;
+  };
+  spec.lhsInput = *lhsIdx;
+  spec.rhsInput = *rhsIdx;
+  if (bcastOf(spec.lhsInput) && !bcastOf(spec.rhsInput) &&
+      spec.kind != FpuBinaryKind::Sub)
+    std::swap(spec.lhsInput, spec.rhsInput);
+  if (bcastOf(spec.lhsInput))
+    return std::nullopt;
+  spec.bcast = bcastOf(spec.rhsInput);
+  if (spec.bcast && spec.kind == FpuBinaryKind::Sub &&
+      *spec.bcast != BcastType::Col)
+    return std::nullopt;
+  // An FPU multiply takes one pass per fidelity phase (four at HiFi4), the
+  // SFPU one pass: a multiply of two full tiles stays on the SFPU, a multiply
+  // by a broadcast takes the FPU to avoid materializing the broadcast.
+  if (spec.kind == FpuBinaryKind::Mul && !spec.bcast)
+    return std::nullopt;
+  return spec;
+}
+
+static LogicalResult emitFpuBinaryInit(ConversionPatternRewriter &rewriter,
+                                       Location loc, const FpuBinarySpec &spec,
+                                       Value lhsCb, Value rhsCb) {
+  if (!spec.bcast) {
+    switch (spec.kind) {
+    case FpuBinaryKind::Add:
+      rewriter.create<AddTilesInitOp>(loc, lhsCb, rhsCb);
+      break;
+    case FpuBinaryKind::Sub:
+      rewriter.create<SubTilesInitOp>(loc, lhsCb, rhsCb);
+      break;
+    case FpuBinaryKind::Mul:
+      rewriter.create<MulTilesInitOp>(loc, lhsCb, rhsCb);
+      break;
+    }
+    return success();
+  }
+  FailureOr<Value> lhsLiteral = createEmitCCBLiteral(rewriter, loc, lhsCb);
+  FailureOr<Value> rhsLiteral = createEmitCCBLiteral(rewriter, loc, rhsCb);
+  if (failed(lhsLiteral) || failed(rhsLiteral))
+    return failure();
+  bool cols = *spec.bcast == BcastType::Col;
+  StringRef callee;
+  switch (spec.kind) {
+  case FpuBinaryKind::Add:
+    callee = cols ? "add_bcast_cols_init_short" : "add_bcast_rows_init_short";
+    break;
+  case FpuBinaryKind::Sub:
+    callee = "sub_bcast_cols_init_short";
+    break;
+  case FpuBinaryKind::Mul:
+    callee = cols ? "mul_bcast_cols_init_short" : "mul_bcast_rows_init_short";
+    break;
+  }
+  rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange(), callee, nullptr,
+                                       nullptr,
+                                       ValueRange{*lhsLiteral, *rhsLiteral});
+  return success();
+}
+
+static LogicalResult emitFpuBinaryTile(ConversionPatternRewriter &rewriter,
+                                       Location loc, const FpuBinarySpec &spec,
+                                       Value lhsCb, Value rhsCb, Value lhsTile,
+                                       Value rhsTile, Value dstReg) {
+  if (!spec.bcast) {
+    switch (spec.kind) {
+    case FpuBinaryKind::Add:
+      AddTilesOp::create(rewriter, loc, lhsCb, rhsCb, lhsTile, rhsTile, dstReg);
+      break;
+    case FpuBinaryKind::Sub:
+      SubTilesOp::create(rewriter, loc, lhsCb, rhsCb, lhsTile, rhsTile, dstReg);
+      break;
+    case FpuBinaryKind::Mul:
+      MulTilesOp::create(rewriter, loc, lhsCb, rhsCb, lhsTile, rhsTile, dstReg);
+      break;
+    }
+    return success();
+  }
+  FailureOr<Value> lhsLiteral = createEmitCCBLiteral(rewriter, loc, lhsCb);
+  FailureOr<Value> rhsLiteral = createEmitCCBLiteral(rewriter, loc, rhsCb);
+  if (failed(lhsLiteral) || failed(rhsLiteral))
+    return failure();
+  bool cols = *spec.bcast == BcastType::Col;
+  StringRef callee;
+  switch (spec.kind) {
+  case FpuBinaryKind::Add:
+    callee = cols ? "add_tiles_bcast_cols" : "add_tiles_bcast_rows";
+    break;
+  case FpuBinaryKind::Sub:
+    callee = "sub_tiles_bcast_cols";
+    break;
+  case FpuBinaryKind::Mul:
+    callee = cols ? "mul_tiles_bcast_cols" : "mul_tiles_bcast_rows";
+    break;
+  }
+  rewriter.create<emitc::CallOpaqueOp>(
+      loc, TypeRange(), callee, nullptr, nullptr,
+      ValueRange{*lhsLiteral, *rhsLiteral, lhsTile, rhsTile, dstReg});
+  return success();
+}
+
+/// FPU ops of the same form whose operands have the same data formats share
+/// one unpack and math configuration, whichever CBs they read.
+static bool haveSameFpuConfig(linalg::GenericOp op, const FpuBinarySpec &a,
+                              const FpuBinarySpec &b) {
+  auto elementType = [&](unsigned idx) {
+    return cast<ShapedType>(op.getDpsInputs()[idx].getType()).getElementType();
+  };
+  return a.kind == b.kind && a.bcast == b.bcast &&
+         elementType(a.lhsInput) == elementType(b.lhsInput) &&
+         elementType(a.rhsInput) == elementType(b.rhsInput);
+}
+
+/// The unpack configurations the tile body of an elementwise generic needs:
+/// copy_tile for leaves loaded into DST and one per distinct FPU op form.
+static void collectElementwiseLoads(
+    Value value, linalg::GenericOp op,
+    ArrayRef<std::optional<BcastType>> tileBcastByInput,
+    ArrayRef<std::optional<Value>> runtimeScalarBitsByInput, bool fpuEnabled,
+    bool &usesCopy, SmallVectorImpl<FpuBinarySpec> &fpuOps) {
+  if (auto inputIdx = getBodyInputIndex(op, value)) {
+    if (!(*inputIdx < runtimeScalarBitsByInput.size() &&
+          runtimeScalarBitsByInput[*inputIdx].has_value()))
+      usesCopy = true;
+    return;
+  }
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp || defOp->getBlock() != &op.getRegion().front())
+    return;
+  if (fpuEnabled) {
+    if (auto spec = matchFpuBinary(defOp, op, tileBcastByInput,
+                                   runtimeScalarBitsByInput)) {
+      if (llvm::none_of(fpuOps, [&](const FpuBinarySpec &other) {
+            return haveSameFpuConfig(op, *spec, other);
+          }))
+        fpuOps.push_back(*spec);
+      return;
+    }
+  }
+  for (Value operand : defOp->getOperands()) {
+    if (getConstFloatValue(operand))
+      continue;
+    collectElementwiseLoads(operand, op, tileBcastByInput,
+                            runtimeScalarBitsByInput, fpuEnabled, usesCopy,
+                            fpuOps);
+  }
+}
+
 static LogicalResult emitElementwiseExprToReg(
     Value exprValue, int dstReg, int tmpRegA, int tmpRegB, linalg::GenericOp op,
     linalg::GenericOp::Adaptor adaptor, ConversionPatternRewriter &rewriter,
     Location loc, ArrayRef<Value> inputCbs, Value tileIdx,
     ArrayRef<std::optional<Value>> broadcastTileIdxByInput,
-    ArrayRef<std::optional<Value>> runtimeScalarBitsByInput) {
+    ArrayRef<std::optional<Value>> runtimeScalarBitsByInput,
+    ArrayRef<std::optional<BcastType>> tileBcastByInput, bool fpuEnabled,
+    bool inlineInits) {
   auto emitLeaf = [&](Value value, int reg, bool &handled) -> LogicalResult {
     auto inputIdx = getBodyInputIndex(op, value);
     if (!inputIdx) {
@@ -2572,7 +2875,12 @@ static LogicalResult emitElementwiseExprToReg(
     if (*inputIdx < runtimeScalarBitsByInput.size() &&
         runtimeScalarBitsByInput[*inputIdx].has_value())
       return failure();
+    // An in-tile broadcast input is only read by FPU broadcast ops.
+    if (*inputIdx < tileBcastByInput.size() && tileBcastByInput[*inputIdx])
+      return failure();
 
+    if (inlineInits)
+      rewriter.create<CopyTileInitOp>(loc, inputCbs[*inputIdx]);
     if (*inputIdx < broadcastTileIdxByInput.size() &&
         broadcastTileIdxByInput[*inputIdx].has_value()) {
       rewriter.create<CopyTileOp>(loc, inputCbs[*inputIdx],
@@ -2582,6 +2890,32 @@ static LogicalResult emitElementwiseExprToReg(
 
     rewriter.create<CopyTileOp>(loc, inputCbs[*inputIdx], tileIdx, regVal);
     return success();
+  };
+
+  auto emitFpuBinary = [&](Operation *defOp, int reg,
+                           bool &handled) -> LogicalResult {
+    handled = false;
+    if (!fpuEnabled)
+      return success();
+    auto spec = matchFpuBinary(defOp, op, tileBcastByInput,
+                               runtimeScalarBitsByInput);
+    if (!spec)
+      return success();
+    handled = true;
+    auto tileOf = [&](unsigned idx) {
+      return idx < broadcastTileIdxByInput.size() &&
+                     broadcastTileIdxByInput[idx].has_value()
+                 ? *broadcastTileIdxByInput[idx]
+                 : tileIdx;
+    };
+    Value lhsCb = inputCbs[spec->lhsInput];
+    Value rhsCb = inputCbs[spec->rhsInput];
+    if (inlineInits &&
+        failed(emitFpuBinaryInit(rewriter, loc, *spec, lhsCb, rhsCb)))
+      return failure();
+    return emitFpuBinaryTile(rewriter, loc, *spec, lhsCb, rhsCb,
+                             tileOf(spec->lhsInput), tileOf(spec->rhsInput),
+                             i32Const(rewriter, loc, reg));
   };
 
   auto emitRhsFirstForOperands = [&](Value lhs, Value rhs) -> bool {
@@ -2599,8 +2933,8 @@ static LogicalResult emitElementwiseExprToReg(
 
   return emitGenericExprToRegImpl(
       exprValue, dstReg, tmpRegA, tmpRegB, op, adaptor, rewriter, loc,
-      /*emitInlineInitOps=*/false, /*allowMaximumFOp=*/false, emitLeaf,
-      emitRhsFirstForOperands, lookupRuntimeScalarBits);
+      /*emitInlineInitOps=*/inlineInits, /*allowMaximumFOp=*/false, emitLeaf,
+      emitRhsFirstForOperands, lookupRuntimeScalarBits, emitFpuBinary);
 }
 
 static LogicalResult rewriteReduceGeneric(linalg::GenericOp op,
@@ -3259,6 +3593,24 @@ static LogicalResult rewriteElementwiseGeneric(linalg::GenericOp op,
     CBReserveBackOp::create(rewriter, loc, outCb,
                             i32Const(rewriter, loc, analysis.outTiles));
 
+  SmallVector<std::optional<BcastType>, 4> tileBcastByInput(numInputs,
+                                                            std::nullopt);
+  for (unsigned i = 0; i < numInputs && i < analysis.broadcastsByInput.size();
+       ++i)
+    if (analysis.broadcastsByInput[i])
+      tileBcastByInput[i] = analysis.broadcastsByInput[i]->tileBcast;
+
+  // With one unpack configuration in the tile body (only copy_tile leaves, or
+  // a single FPU op form) its init is hoisted out of the tile loop; otherwise
+  // every load and SFPU op re-inits before it runs.
+  bool fpuEnabled = isFpuElementwiseEnabled(op);
+  bool usesCopy = false;
+  SmallVector<FpuBinarySpec, 2> fpuOps;
+  collectElementwiseLoads(analysis.yieldValue, op, tileBcastByInput,
+                          runtimeScalarBitsByInput, fpuEnabled, usesCopy,
+                          fpuOps);
+  bool inlineInits = !fpuOps.empty() && (usesCopy || fpuOps.size() > 1);
+
   Value inCbForInit = outCb;
   for (auto [idx, inputCb] : llvm::enumerate(inputCbs)) {
     if (analysis.usedInputs.test(idx) &&
@@ -3268,15 +3620,26 @@ static LogicalResult rewriteElementwiseGeneric(linalg::GenericOp op,
       break;
     }
   }
-  rewriter.create<InitSFPUOp>(loc, inCbForInit, outCb);
+  if (fpuOps.empty())
+    rewriter.create<InitSFPUOp>(loc, inCbForInit, outCb);
+  else
+    rewriter.create<BinaryOpInitCommonOp>(loc, inputCbs[fpuOps[0].lhsInput],
+                                          inputCbs[fpuOps[0].rhsInput], outCb);
   for (auto [idx, inputCb] : llvm::enumerate(inputCbs)) {
     if (!analysis.usedInputs.test(idx))
       continue;
     if (idx < runtimeScalarBitsByInput.size() &&
         runtimeScalarBitsByInput[idx].has_value())
       continue;
+    if (tileBcastByInput[idx])
+      continue;
     rewriter.create<CopyTileInitOp>(loc, inputCb);
   }
+  if (fpuOps.size() == 1 && !usesCopy &&
+      failed(emitFpuBinaryInit(rewriter, loc, fpuOps[0],
+                               inputCbs[fpuOps[0].lhsInput],
+                               inputCbs[fpuOps[0].rhsInput])))
+    return failure();
   if (analysis.needsBinopWithScalar)
     rewriter.create<BinopWithScalarTileInitOp>(loc);
   if (analysis.needsSubBinary)
@@ -3332,7 +3695,8 @@ static LogicalResult rewriteElementwiseGeneric(linalg::GenericOp op,
         return emitElementwiseExprToReg(
             analysis.yieldValue, /*dstReg=*/0, /*tmpRegA=*/1, /*tmpRegB=*/2, op,
             adaptor, rewriter, loc, inputCbs, tileIdx, broadcastTileIdxByInput,
-            runtimeScalarBitsByInput);
+            runtimeScalarBitsByInput, tileBcastByInput, fpuEnabled,
+            inlineInits);
       });
   if (failed(result))
     return failure();
@@ -4746,4 +5110,256 @@ void mlir::loom::populateComputeOpConversionPatterns(
   patterns.add<ConvertMemrefExpandShapeOp>(typeConverter, context);
   patterns.add<ConvertFlashAttentionGenericOp>(typeConverter, context,
                                                std::move(tracker));
+}
+
+namespace {
+
+/// How a folded broadcast's block argument is used in one consumer body.
+enum class FoldedBroadcastUse { FpuOperand, Divisor, Unsupported };
+
+/// Classifies every use of @p arg (the consumer's block argument for the
+/// broadcast) for an in-tile broadcast: each must be the broadcast operand of
+/// an add/sub/mul whose other operand is a non-broadcast input, or the divisor
+/// of such an input. Mixing multiplies and divisions is unsupported because a
+/// division rewrites the source into its reciprocal.
+FoldedBroadcastUse classifyInTileBroadcastUses(linalg::GenericOp op,
+                                               BlockArgument arg,
+                                               BcastType bcast,
+                                               ArrayRef<int64_t> foldedDims) {
+  auto isPlainInput = [&](Value value) {
+    auto idx = getBodyInputIndex(op, value);
+    return idx && value != arg && foldedDims[*idx] < 0;
+  };
+  bool fpu = false;
+  bool divisor = false;
+  for (Operation *user : arg.getUsers()) {
+    if (isa<arith::AddFOp, arith::MulFOp>(user)) {
+      Value other = user->getOperand(0) == arg ? user->getOperand(1)
+                                               : user->getOperand(0);
+      if (!isPlainInput(other))
+        return FoldedBroadcastUse::Unsupported;
+      fpu = true;
+    } else if (auto subOp = dyn_cast<arith::SubFOp>(user)) {
+      if (subOp.getRhs() != arg || !isPlainInput(subOp.getLhs()) ||
+          bcast != BcastType::Col)
+        return FoldedBroadcastUse::Unsupported;
+      fpu = true;
+    } else if (auto divOp = dyn_cast<arith::DivFOp>(user)) {
+      if (divOp.getRhs() != arg || !isPlainInput(divOp.getLhs()))
+        return FoldedBroadcastUse::Unsupported;
+      divisor = true;
+    } else {
+      return FoldedBroadcastUse::Unsupported;
+    }
+  }
+  if (fpu && divisor)
+    return FoldedBroadcastUse::Unsupported;
+  return divisor ? FoldedBroadcastUse::Divisor : FoldedBroadcastUse::FpuOperand;
+}
+
+SmallVector<int64_t, 4> getFoldedBroadcastDims(linalg::GenericOp op) {
+  SmallVector<int64_t, 4> dims(op.getNumDpsInputs(), -1);
+  if (auto attr =
+          op->getAttrOfType<DenseI64ArrayAttr>(kFoldedBroadcastDimsAttrName))
+    if (attr.size() == static_cast<int64_t>(dims.size()))
+      llvm::copy(attr.asArrayRef(), dims.begin());
+  return dims;
+}
+
+/// Erases @p buffer's semaphore gives, take and alloc once nothing else uses it.
+void eraseUnusedBuffer(Value buffer) {
+  if (!llvm::all_of(buffer.getUsers(), [](Operation *user) {
+        return isa<::loom::SemaphoreGiveOp>(user);
+      }))
+    return;
+  for (Operation *user : llvm::make_early_inc_range(buffer.getUsers()))
+    user->erase();
+  auto take = buffer.getDefiningOp<::loom::SemaphoreTakeOp>();
+  if (!take || !take->use_empty())
+    return;
+  Value allocated = take->getOperand(0);
+  take->erase();
+  if (auto alloc = allocated.getDefiningOp<::loom::AllocOp>())
+    if (alloc->use_empty())
+      alloc->erase();
+}
+
+bool foldMaterializedBroadcast(::loom::BroadcastOp broadcast) {
+  if (broadcast->getNumResults() != 1)
+    return false;
+  Value source = broadcast.getIns();
+  Value buffer = broadcast.getInit();
+  Value result = broadcast->getResult(0);
+  if (stripElementwiseInputWrappers(source) ==
+      stripElementwiseInputWrappers(buffer))
+    return false;
+
+  auto sourceType = dyn_cast<MemRefType>(source.getType());
+  auto outType = dyn_cast<MemRefType>(buffer.getType());
+  if (!sourceType || !outType || !sourceType.hasStaticShape() ||
+      !outType.hasStaticShape())
+    return false;
+  unsigned rank = outType.getRank();
+  int64_t dim = broadcast.getDim();
+  if (dim < 0 || dim >= static_cast<int64_t>(rank))
+    return false;
+  bool sameRank = sourceType.getRank() == static_cast<int64_t>(rank);
+  if (sameRank) {
+    for (unsigned d = 0; d < rank; ++d)
+      if (sourceType.getShape()[d] !=
+          (static_cast<int64_t>(d) == dim ? 1 : outType.getShape()[d]))
+        return false;
+  } else if (!(sourceType.getRank() + 1 == static_cast<int64_t>(rank) &&
+               dim == 0 &&
+               sourceType.getShape() == outType.getShape().drop_front())) {
+    return false;
+  }
+  std::optional<BcastType> tileBcast = getUnaryBcastType(
+      classifyElementwiseBroadcastKind(static_cast<unsigned>(dim), rank));
+
+  Block *block = broadcast->getBlock();
+  SmallVector<linalg::GenericOp, 4> consumers;
+  bool divisor = false;
+  for (OpOperand &use : result.getUses()) {
+    auto consumer = dyn_cast<linalg::GenericOp>(use.getOwner());
+    if (!consumer || consumer->getBlock() != block ||
+        !broadcast->isBeforeInBlock(consumer) || !consumer.isDpsInput(&use) ||
+        consumer.getNumDpsInits() != 1 || !isAllParallelGeneric(consumer) ||
+        consumer.getNumLoops() != rank)
+      return false;
+    auto maps = consumer.getIndexingMapsArray();
+    if (!isIdentityMapForRank(maps[use.getOperandNumber()], rank) ||
+        !isIdentityMapForRank(maps.back(), rank))
+      return false;
+    if (isSupportedFusedMulBcastAddGeneric(consumer) ||
+        isSupportedInplaceBinaryBcastColsGeneric(consumer) ||
+        isSupportedAddInplaceGeneric(consumer))
+      return false;
+    if (tileBcast) {
+      BlockArgument arg =
+          consumer.getRegion().front().getArgument(use.getOperandNumber());
+      switch (classifyInTileBroadcastUses(consumer, arg, *tileBcast,
+                                          getFoldedBroadcastDims(consumer))) {
+      case FoldedBroadcastUse::Unsupported:
+        return false;
+      case FoldedBroadcastUse::Divisor:
+        divisor = true;
+        break;
+      default:
+        break;
+      }
+    }
+    if (!llvm::is_contained(consumers, consumer))
+      consumers.push_back(consumer);
+  }
+  if (consumers.empty())
+    return false;
+  // The buffer may only be read once a consumer has overwritten it with its
+  // own result; until then it holds the broadcast.
+  Operation *firstWriter = nullptr;
+  for (linalg::GenericOp consumer : consumers)
+    if (llvm::is_contained(consumer.getDpsInits(), buffer) &&
+        (!firstWriter || consumer->isBeforeInBlock(firstWriter)))
+      firstWriter = consumer;
+  for (Operation *user : buffer.getUsers()) {
+    if (user == broadcast.getOperation() ||
+        isa<::loom::SemaphoreGiveOp>(user))
+      continue;
+    auto consumer = dyn_cast<linalg::GenericOp>(user);
+    if (consumer && llvm::is_contained(consumers, consumer) &&
+        llvm::is_contained(consumer.getDpsInits(), buffer))
+      continue;
+    if (firstWriter && user->getBlock() == block &&
+        firstWriter->isBeforeInBlock(user))
+      continue;
+    return false;
+  }
+
+  // A division by the broadcast becomes a multiply by the reciprocal of the
+  // source, computed in place once; the source must have no reader past the
+  // broadcast but its semaphore give.
+  if (divisor) {
+    if (!sameRank)
+      return false;
+    for (Operation *user : source.getUsers())
+      if (user != broadcast.getOperation() &&
+          !isa<::loom::SemaphoreGiveOp>(user) &&
+          !(user->getBlock() == block && user->isBeforeInBlock(broadcast)))
+        return false;
+  }
+
+  OpBuilder builder(broadcast);
+  Location loc = broadcast.getLoc();
+  MLIRContext *ctx = builder.getContext();
+  if (divisor) {
+    auto identity = AffineMap::getMultiDimIdentityMap(rank, ctx);
+    SmallVector<utils::IteratorType> iterators(rank,
+                                               utils::IteratorType::parallel);
+    Type elemType = sourceType.getElementType();
+    linalg::GenericOp::create(
+        builder, loc, TypeRange{}, ValueRange{source}, ValueRange{source},
+        ArrayRef<AffineMap>{identity, identity}, iterators,
+        [&](OpBuilder &b, Location l, ValueRange args) {
+          Value one = arith::ConstantOp::create(
+              b, l, elemType, b.getFloatAttr(elemType, 1.0));
+          Value recip = arith::DivFOp::create(b, l, one, args[0]);
+          linalg::YieldOp::create(b, l, recip);
+        });
+  }
+
+  Operation *lastConsumer = consumers.front();
+  for (linalg::GenericOp consumer : consumers) {
+    if (lastConsumer->isBeforeInBlock(consumer))
+      lastConsumer = consumer;
+    SmallVector<AffineMap> maps = consumer.getIndexingMapsArray();
+    SmallVector<int64_t, 4> foldedDims = getFoldedBroadcastDims(consumer);
+    for (OpOperand *input : consumer.getDpsInputOperands()) {
+      if (input->get() != result)
+        continue;
+      unsigned idx = input->getOperandNumber();
+      SmallVector<AffineExpr> exprs;
+      for (unsigned d = 0; d < rank; ++d) {
+        if (static_cast<int64_t>(d) != dim)
+          exprs.push_back(getAffineDimExpr(d, ctx));
+        else if (sameRank)
+          exprs.push_back(getAffineConstantExpr(0, ctx));
+      }
+      maps[idx] = AffineMap::get(rank, 0, exprs, ctx);
+      foldedDims[idx] = dim;
+      input->set(source);
+      if (divisor) {
+        BlockArgument arg = consumer.getRegion().front().getArgument(idx);
+        for (Operation *user : llvm::make_early_inc_range(arg.getUsers())) {
+          auto divOp = cast<arith::DivFOp>(user);
+          OpBuilder bodyBuilder(divOp);
+          Value product = arith::MulFOp::create(bodyBuilder, divOp.getLoc(),
+                                                divOp.getLhs(), divOp.getRhs());
+          divOp.getResult().replaceAllUsesWith(product);
+          divOp.erase();
+        }
+      }
+    }
+    consumer.setIndexingMapsAttr(builder.getAffineMapArrayAttr(maps));
+    consumer->setAttr(kFoldedBroadcastDimsAttrName,
+                      builder.getDenseI64ArrayAttr(foldedDims));
+  }
+
+  // The source is now read by the consumers: release it after the last one.
+  for (Operation *user : llvm::make_early_inc_range(source.getUsers()))
+    if (isa<::loom::SemaphoreGiveOp>(user) && user->getBlock() == block &&
+        broadcast->isBeforeInBlock(user) && user->isBeforeInBlock(lastConsumer))
+      user->moveAfter(lastConsumer);
+
+  broadcast->erase();
+  eraseUnusedBuffer(buffer);
+  return true;
+}
+
+} // namespace
+
+void mlir::loom::foldMaterializedBroadcasts(ModuleOp module) {
+  SmallVector<::loom::BroadcastOp> broadcasts;
+  module.walk([&](::loom::BroadcastOp op) { broadcasts.push_back(op); });
+  for (::loom::BroadcastOp op : broadcasts)
+    (void)foldMaterializedBroadcast(op);
 }

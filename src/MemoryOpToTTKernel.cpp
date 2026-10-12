@@ -834,6 +834,17 @@ static bool isSemaphoreGiveForGatherInput(::loom::SemaphoreGiveOp giveOp) {
   return found;
 }
 
+/// The DRAM batch size set on the module enclosing the rewriter's insertion
+/// point, if any.
+static std::optional<int64_t>
+getDramBatchTiles(ConversionPatternRewriter &rewriter) {
+  for (Operation *op = rewriter.getInsertionBlock()->getParentOp(); op;
+       op = op->getParentOp())
+    if (auto attr = op->getAttrOfType<IntegerAttr>(kDramBatchTilesAttrName))
+      return attr.getInt();
+  return std::nullopt;
+}
+
 /**
  * @brief Emit TTKernel NOC async read operations for a DRAM-to-L1 transfer.
  *
@@ -852,7 +863,8 @@ static bool isSemaphoreGiveForGatherInput(::loom::SemaphoreGiveOp giveOp) {
 std::pair<Value, Value> dram_read(Value source, Location loc,
                                    ConversionPatternRewriter &rewriter,
                                    CopyBindingData *bindingData,
-                                   bool matmulMergeBReaderIntoWriter) {
+                                   bool matmulMergeBReaderIntoWriter,
+                                   bool multicastSender) {
   auto reinterpretCastOp = source.getDefiningOp<memref::ReinterpretCastOp>();
   if (!reinterpretCastOp) {
     emitError(loc) << "DRAM read source must be memref.reinterpret_cast";
@@ -1127,6 +1139,14 @@ std::pair<Value, Value> dram_read(Value source, Location loc,
       barrierReadThreshold = (512 / numCores) * (1024 + 128) / 2048;
       if (barrierReadThreshold < 1)
         barrierReadThreshold = 1;
+    }
+    // A multicast sender reads one block for several cores: the block is
+    // issued whole, like a TT-NN matmul reader, before a single barrier.
+    if (multicastSender)
+      enableReadBarrier = false;
+    if (auto batch = getDramBatchTiles(rewriter)) {
+      enableReadBarrier = *batch > 0 && totalTiles > *batch;
+      barrierReadThreshold = std::max<int64_t>(*batch, 1);
     }
 
     emitTiledMemrefTransferLoop(
@@ -1658,7 +1678,7 @@ struct ConvertLoomMemoryLoadOp : public OpConversionPattern<::loom::CopyOp> {
             ifOp.getThenRegion().front().getTerminator());
         auto [totalSizeBytes, multicast_l1Addr] = dram_read(
             source, loc, rewriter, bindingData,
-            matmulMergeBReaderIntoWriter);
+            matmulMergeBReaderIntoWriter, /*multicastSender=*/true);
         if (!totalSizeBytes || !multicast_l1Addr)
           return op.emitOpError("failed to emit DRAM read for multicast send");
         multicast_send(rewriter, loc, bindingData, totalSizeBytes,
@@ -1672,7 +1692,7 @@ struct ConvertLoomMemoryLoadOp : public OpConversionPattern<::loom::CopyOp> {
     } else {
       auto [totalSizeBytes, multicast_l1Addr] = dram_read(
           source, loc, rewriter, bindingData,
-          matmulMergeBReaderIntoWriter);
+          matmulMergeBReaderIntoWriter, /*multicastSender=*/false);
       if (!totalSizeBytes || !multicast_l1Addr)
         return op.emitOpError("failed to emit DRAM read");
     }
@@ -1995,6 +2015,10 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
       barrierWriteThreshold = (512 / numCores) * (1024 + 128) / 2048;
       if (barrierWriteThreshold < 1)
         barrierWriteThreshold = 1;
+    }
+    if (auto batch = getDramBatchTiles(rewriter)) {
+      enableWriteBarrier = *batch > 0 && totalTiles > *batch;
+      barrierWriteThreshold = std::max<int64_t>(*batch, 1);
     }
 
     emitTiledMemrefTransferLoop(

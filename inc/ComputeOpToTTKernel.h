@@ -41,6 +41,13 @@ void populateComputeOpConversionPatterns(mlir::RewritePatternSet &patterns,
 /// FlashAttention compute forms handled by this pass.
 bool isSupportedFlashAttentionGeneric(mlir::linalg::GenericOp op);
 
+/// Folds each loom.broadcast whose result only feeds elementwise generics into
+/// those generics: they read the broadcast source through a broadcasting
+/// indexing map, add/sub/mul take it as the broadcast operand of an FPU tile
+/// op, and a division by it becomes one reciprocal of the source and a
+/// multiply. A broadcast with any other use stays materialized.
+void foldMaterializedBroadcasts(mlir::ModuleOp module);
+
 /// Returns true when this `linalg.copy` is a compute-kernel copy handled by
 /// this pass.
 bool shouldConvertComputeLinalgCopy(mlir::linalg::CopyOp op);
