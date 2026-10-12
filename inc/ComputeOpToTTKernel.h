@@ -48,6 +48,11 @@ bool isSupportedFlashAttentionGeneric(mlir::linalg::GenericOp op);
 /// multiply. A broadcast with any other use stays materialized.
 void foldMaterializedBroadcasts(mlir::ModuleOp module);
 
+/// Erases each zero fill whose buffer is next touched as the output of a
+/// matmul. The matmul lowering overwrites its output on the first k block
+/// (L1 accumulation starts on the second), so the filled tiles are never read.
+void eraseOverwrittenAccumulatorFills(mlir::ModuleOp module);
+
 /// Returns true when this `linalg.copy` is a compute-kernel copy handled by
 /// this pass.
 bool shouldConvertComputeLinalgCopy(mlir::linalg::CopyOp op);

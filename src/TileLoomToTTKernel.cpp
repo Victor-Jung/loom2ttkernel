@@ -716,6 +716,12 @@ public:
                 "Fold broadcasts that only feed elementwise ops into them and "
                 "lower add/sub/mul of two inputs to FPU tile ops"),
             llvm::cl::init(true)),
+        elideAccumulatorZeroFill(
+            *this, "elide-accumulator-zero-fill",
+            llvm::cl::desc(
+                "Drop zero fills of a matmul output that the first k block "
+                "overwrites"),
+            llvm::cl::init(true)),
         dramBatchTiles(
             *this, "dram-batch-tiles",
             llvm::cl::desc(
@@ -758,6 +764,12 @@ public:
                 "Fold broadcasts that only feed elementwise ops into them and "
                 "lower add/sub/mul of two inputs to FPU tile ops"),
             llvm::cl::init(true)),
+        elideAccumulatorZeroFill(
+            *this, "elide-accumulator-zero-fill",
+            llvm::cl::desc(
+                "Drop zero fills of a matmul output that the first k block "
+                "overwrites"),
+            llvm::cl::init(true)),
         dramBatchTiles(
             *this, "dram-batch-tiles",
             llvm::cl::desc(
@@ -781,6 +793,7 @@ public:
     matmulStreamOutputSubblocks =
         static_cast<bool>(other.matmulStreamOutputSubblocks);
     fpuElementwise = static_cast<bool>(other.fpuElementwise);
+    elideAccumulatorZeroFill = static_cast<bool>(other.elideAccumulatorZeroFill);
     dramBatchTiles = static_cast<int64_t>(other.dramBatchTiles);
     reduceProtocolOpt = other.reduceProtocolOpt;
     reduceProtocolDeprecated = other.reduceProtocolDeprecated;
@@ -812,6 +825,7 @@ public:
   Option<bool> matmulSplitHalfDataMovementCores;
   Option<bool> matmulStreamOutputSubblocks;
   Option<bool> fpuElementwise;
+  Option<bool> elideAccumulatorZeroFill;
   Option<int64_t> dramBatchTiles;
   Option<std::string> reduceProtocolOpt;
   /// @deprecated Use reduce-protocol instead.
@@ -896,6 +910,8 @@ public:
       module->setAttr(kFpuElementwiseAttrName, UnitAttr::get(&getContext()));
       foldMaterializedBroadcasts(module);
     }
+    if (elideAccumulatorZeroFill)
+      eraseOverwrittenAccumulatorFills(module);
     if (dramBatchTiles >= 0)
       module->setAttr(kDramBatchTilesAttrName,
                       IntegerAttr::get(IntegerType::get(&getContext(), 64),

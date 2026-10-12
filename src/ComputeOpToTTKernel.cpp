@@ -1974,6 +1974,8 @@ static LogicalResult analyzeGenericExprTree(
 
     if (auto divOp = dyn_cast<arith::DivFOp>(defOp)) {
       setFlag(GenericExprFeature::Recip);
+      if (getConstFloatValue(divOp.getLhs()) == 1.0)
+        return self(self, divOp.getRhs());
       setFlag(GenericExprFeature::MulBinary);
       if (failed(self(self, divOp.getLhs())))
         return failure();
@@ -2309,6 +2311,14 @@ static LogicalResult emitGenericExprToRegImpl(
     }
 
     if (auto divOp = dyn_cast<arith::DivFOp>(defOp)) {
+      if (getConstFloatValue(divOp.getLhs()) == 1.0) {
+        if (failed(self(self, divOp.getRhs(), curDstReg, curTmpRegA, curTmpRegB)))
+          return failure();
+        if (emitInlineInitOps)
+          rewriter.create<RecipTileInitOp>(loc);
+        rewriter.create<RecipTileOp>(loc, curDstRegVal);
+        return success();
+      }
       bool emitRhsFirst = emitRhsFirstForOperands(divOp.getLhs(), divOp.getRhs());
       if (emitRhsFirst) {
         if (failed(self(self, divOp.getRhs(), curTmpRegA, curTmpRegB, curDstReg)))
@@ -2716,9 +2726,6 @@ matchFpuBinary(Operation *defOp, linalg::GenericOp op,
   if (bcastOf(spec.lhsInput))
     return std::nullopt;
   spec.bcast = bcastOf(spec.rhsInput);
-  if (spec.bcast && spec.kind == FpuBinaryKind::Sub &&
-      *spec.bcast != BcastType::Col)
-    return std::nullopt;
   // An FPU multiply takes one pass per fidelity phase (four at HiFi4), the
   // SFPU one pass: a multiply of two full tiles stays on the SFPU, a multiply
   // by a broadcast takes the FPU to avoid materializing the broadcast.
@@ -2749,6 +2756,23 @@ static LogicalResult emitFpuBinaryInit(ConversionPatternRewriter &rewriter,
   if (failed(lhsLiteral) || failed(rhsLiteral))
     return failure();
   bool cols = *spec.bcast == BcastType::Col;
+  if (spec.kind == FpuBinaryKind::Sub && !cols) {
+    // The compute API has no short init for a row-broadcast subtract; this is
+    // sub_bcast_cols_init_short with the row broadcast.
+    std::optional<std::string> lhsExpr = getStaticCBExpr(lhsCb);
+    std::optional<std::string> rhsExpr = getStaticCBExpr(rhsCb);
+    if (!lhsExpr || !rhsExpr)
+      return failure();
+    std::string operands = *lhsExpr + ", " + *rhsExpr;
+    rewriter.create<emitc::VerbatimOp>(
+        loc, "MATH((llk_math_eltwise_binary_init_with_operands<ELWSUB, "
+             "BroadcastType::ROW, MATH_FIDELITY>(" +
+                 operands + ")));");
+    rewriter.create<emitc::VerbatimOp>(
+        loc, "UNPACK((llk_unpack_AB_init<BroadcastType::ROW>(" + operands +
+                 ")));");
+    return success();
+  }
   StringRef callee;
   switch (spec.kind) {
   case FpuBinaryKind::Add:
@@ -2796,7 +2820,8 @@ static LogicalResult emitFpuBinaryTile(ConversionPatternRewriter &rewriter,
     callee = cols ? "add_tiles_bcast_cols" : "add_tiles_bcast_rows";
     break;
   case FpuBinaryKind::Sub:
-    callee = "sub_tiles_bcast_cols";
+    callee = cols ? "sub_tiles_bcast_cols"
+                  : "sub_tiles_bcast<BroadcastType::ROW>";
     break;
   case FpuBinaryKind::Mul:
     callee = cols ? "mul_tiles_bcast_cols" : "mul_tiles_bcast_rows";
@@ -2821,15 +2846,19 @@ static bool haveSameFpuConfig(linalg::GenericOp op, const FpuBinarySpec &a,
 }
 
 /// The unpack configurations the tile body of an elementwise generic needs:
-/// copy_tile for leaves loaded into DST and one per distinct FPU op form.
+/// copy_tile for leaves loaded into DST, unary_bcast for in-tile broadcast
+/// leaves, and one per distinct FPU op form.
 static void collectElementwiseLoads(
     Value value, linalg::GenericOp op,
     ArrayRef<std::optional<BcastType>> tileBcastByInput,
     ArrayRef<std::optional<Value>> runtimeScalarBitsByInput, bool fpuEnabled,
-    bool &usesCopy, SmallVectorImpl<FpuBinarySpec> &fpuOps) {
+    bool &usesCopy, SmallVectorImpl<FpuBinarySpec> &fpuOps,
+    bool &usesBcastLeaf) {
   if (auto inputIdx = getBodyInputIndex(op, value)) {
-    if (!(*inputIdx < runtimeScalarBitsByInput.size() &&
-          runtimeScalarBitsByInput[*inputIdx].has_value()))
+    if (*inputIdx < tileBcastByInput.size() && tileBcastByInput[*inputIdx])
+      usesBcastLeaf = true;
+    else if (!(*inputIdx < runtimeScalarBitsByInput.size() &&
+               runtimeScalarBitsByInput[*inputIdx].has_value()))
       usesCopy = true;
     return;
   }
@@ -2851,7 +2880,7 @@ static void collectElementwiseLoads(
       continue;
     collectElementwiseLoads(operand, op, tileBcastByInput,
                             runtimeScalarBitsByInput, fpuEnabled, usesCopy,
-                            fpuOps);
+                            fpuOps, usesBcastLeaf);
   }
 }
 
@@ -2875,9 +2904,34 @@ static LogicalResult emitElementwiseExprToReg(
     if (*inputIdx < runtimeScalarBitsByInput.size() &&
         runtimeScalarBitsByInput[*inputIdx].has_value())
       return failure();
-    // An in-tile broadcast input is only read by FPU broadcast ops.
-    if (*inputIdx < tileBcastByInput.size() && tileBcastByInput[*inputIdx])
-      return failure();
+    // An in-tile broadcast input is unpacked into DST with the broadcast.
+    if (*inputIdx < tileBcastByInput.size() && tileBcastByInput[*inputIdx]) {
+      Value cb = inputCbs[*inputIdx];
+      std::optional<std::string> cbExpr = getStaticCBExpr(cb);
+      FailureOr<Value> cbLiteral = createEmitCCBLiteral(rewriter, loc, cb);
+      if (!cbExpr || failed(cbLiteral) ||
+          *inputIdx >= broadcastTileIdxByInput.size() ||
+          !broadcastTileIdxByInput[*inputIdx])
+        return failure();
+      std::string bcast = *tileBcastByInput[*inputIdx] == BcastType::Col
+                              ? "BroadcastType::COL"
+                              : "BroadcastType::ROW";
+      // unary_bcast_init without its hardware configure and packer setup,
+      // which the kernel's common init already did.
+      rewriter.create<emitc::VerbatimOp>(
+          loc, "UNPACK((llk_unpack_A_init<" + bcast +
+                   ", false, EltwiseBinaryReuseDestType::NONE, false>(false, "
+                   "false, " +
+                   *cbExpr + ")));");
+      rewriter.create<emitc::VerbatimOp>(
+          loc, "MATH((llk_math_eltwise_unary_datacopy_init<B2D, "
+               "DST_ACCUM_MODE, " +
+                   bcast + ">(false, false, " + *cbExpr + ")));");
+      rewriter.create<emitc::CallOpaqueOp>(
+          loc, TypeRange(), "unary_bcast<" + bcast + ">", nullptr, nullptr,
+          ValueRange{*cbLiteral, *broadcastTileIdxByInput[*inputIdx], regVal});
+      return success();
+    }
 
     if (inlineInits)
       rewriter.create<CopyTileInitOp>(loc, inputCbs[*inputIdx]);
@@ -3606,10 +3660,12 @@ static LogicalResult rewriteElementwiseGeneric(linalg::GenericOp op,
   bool fpuEnabled = isFpuElementwiseEnabled(op);
   bool usesCopy = false;
   SmallVector<FpuBinarySpec, 2> fpuOps;
+  bool usesBcastLeaf = false;
   collectElementwiseLoads(analysis.yieldValue, op, tileBcastByInput,
                           runtimeScalarBitsByInput, fpuEnabled, usesCopy,
-                          fpuOps);
-  bool inlineInits = !fpuOps.empty() && (usesCopy || fpuOps.size() > 1);
+                          fpuOps, usesBcastLeaf);
+  bool inlineInits =
+      usesBcastLeaf || (!fpuOps.empty() && (usesCopy || fpuOps.size() > 1));
 
   Value inCbForInit = outCb;
   for (auto [idx, inputCb] : llvm::enumerate(inputCbs)) {
@@ -5115,46 +5171,27 @@ void mlir::loom::populateComputeOpConversionPatterns(
 namespace {
 
 /// How a folded broadcast's block argument is used in one consumer body.
-enum class FoldedBroadcastUse { FpuOperand, Divisor, Unsupported };
+enum class FoldedBroadcastUse { Operand, Divisor };
 
-/// Classifies every use of @p arg (the consumer's block argument for the
-/// broadcast) for an in-tile broadcast: each must be the broadcast operand of
-/// an add/sub/mul whose other operand is a non-broadcast input, or the divisor
-/// of such an input. Mixing multiplies and divisions is unsupported because a
-/// division rewrites the source into its reciprocal.
-FoldedBroadcastUse classifyInTileBroadcastUses(linalg::GenericOp op,
-                                               BlockArgument arg,
-                                               BcastType bcast,
-                                               ArrayRef<int64_t> foldedDims) {
-  auto isPlainInput = [&](Value value) {
-    auto idx = getBodyInputIndex(op, value);
-    return idx && value != arg && foldedDims[*idx] < 0;
-  };
-  bool fpu = false;
+/// Classifies the uses of @p arg (the consumer's block argument for the
+/// broadcast): Divisor when every use divides another value by it, which
+/// becomes a multiply by the reciprocal of the source; Operand otherwise, read
+/// as the broadcast operand of an FPU op or unpacked into DST with
+/// unary_bcast. A mix of both is unsupported (nullopt) since a division
+/// rewrites the folded value into its reciprocal.
+std::optional<FoldedBroadcastUse> classifyInTileBroadcastUses(BlockArgument arg) {
+  bool operand = false;
   bool divisor = false;
   for (Operation *user : arg.getUsers()) {
-    if (isa<arith::AddFOp, arith::MulFOp>(user)) {
-      Value other = user->getOperand(0) == arg ? user->getOperand(1)
-                                               : user->getOperand(0);
-      if (!isPlainInput(other))
-        return FoldedBroadcastUse::Unsupported;
-      fpu = true;
-    } else if (auto subOp = dyn_cast<arith::SubFOp>(user)) {
-      if (subOp.getRhs() != arg || !isPlainInput(subOp.getLhs()) ||
-          bcast != BcastType::Col)
-        return FoldedBroadcastUse::Unsupported;
-      fpu = true;
-    } else if (auto divOp = dyn_cast<arith::DivFOp>(user)) {
-      if (divOp.getRhs() != arg || !isPlainInput(divOp.getLhs()))
-        return FoldedBroadcastUse::Unsupported;
+    auto divOp = dyn_cast<arith::DivFOp>(user);
+    if (divOp && divOp.getRhs() == arg && divOp.getLhs() != arg)
       divisor = true;
-    } else {
-      return FoldedBroadcastUse::Unsupported;
-    }
+    else
+      operand = true;
   }
-  if (fpu && divisor)
-    return FoldedBroadcastUse::Unsupported;
-  return divisor ? FoldedBroadcastUse::Divisor : FoldedBroadcastUse::FpuOperand;
+  if (operand && divisor)
+    return std::nullopt;
+  return divisor ? FoldedBroadcastUse::Divisor : FoldedBroadcastUse::Operand;
 }
 
 SmallVector<int64_t, 4> getFoldedBroadcastDims(linalg::GenericOp op) {
@@ -5220,6 +5257,7 @@ bool foldMaterializedBroadcast(::loom::BroadcastOp broadcast) {
   Block *block = broadcast->getBlock();
   SmallVector<linalg::GenericOp, 4> consumers;
   bool divisor = false;
+  bool operand = false;
   for (OpOperand &use : result.getUses()) {
     auto consumer = dyn_cast<linalg::GenericOp>(use.getOwner());
     if (!consumer || consumer->getBlock() != block ||
@@ -5238,21 +5276,18 @@ bool foldMaterializedBroadcast(::loom::BroadcastOp broadcast) {
     if (tileBcast) {
       BlockArgument arg =
           consumer.getRegion().front().getArgument(use.getOperandNumber());
-      switch (classifyInTileBroadcastUses(consumer, arg, *tileBcast,
-                                          getFoldedBroadcastDims(consumer))) {
-      case FoldedBroadcastUse::Unsupported:
+      std::optional<FoldedBroadcastUse> kind = classifyInTileBroadcastUses(arg);
+      if (!kind)
         return false;
-      case FoldedBroadcastUse::Divisor:
+      if (*kind == FoldedBroadcastUse::Divisor)
         divisor = true;
-        break;
-      default:
-        break;
-      }
+      else
+        operand = true;
     }
     if (!llvm::is_contained(consumers, consumer))
       consumers.push_back(consumer);
   }
-  if (consumers.empty())
+  if (consumers.empty() || (divisor && operand))
     return false;
   // The buffer may only be read once a consumer has overwritten it with its
   // own result; until then it holds the broadcast.
@@ -5276,8 +5311,14 @@ bool foldMaterializedBroadcast(::loom::BroadcastOp broadcast) {
   }
 
   // A division by the broadcast becomes a multiply by the reciprocal of the
-  // source, computed in place once; the source must have no reader past the
-  // broadcast but its semaphore give.
+  // source. The reciprocal is computed in place when the source has no reader
+  // past the broadcast but its semaphore give, else into a buffer of its own
+  // that the consumers read and release.
+  bool recipInPlace = true;
+  ::loom::SemaphoreGiveOp bufferGive;
+  for (Operation *user : buffer.getUsers())
+    if (auto give = dyn_cast<::loom::SemaphoreGiveOp>(user))
+      bufferGive = give;
   if (divisor) {
     if (!sameRank)
       return false;
@@ -5285,19 +5326,34 @@ bool foldMaterializedBroadcast(::loom::BroadcastOp broadcast) {
       if (user != broadcast.getOperation() &&
           !isa<::loom::SemaphoreGiveOp>(user) &&
           !(user->getBlock() == block && user->isBeforeInBlock(broadcast)))
+        recipInPlace = false;
+    if (!recipInPlace) {
+      auto take = source.getDefiningOp<::loom::SemaphoreTakeOp>();
+      if (!take || !take->getOperand(0).getDefiningOp<::loom::AllocOp>() ||
+          !bufferGive)
         return false;
+    }
   }
 
   OpBuilder builder(broadcast);
   Location loc = broadcast.getLoc();
   MLIRContext *ctx = builder.getContext();
+  Value folded = source;
+  if (divisor && !recipInPlace) {
+    auto take = source.getDefiningOp<::loom::SemaphoreTakeOp>();
+    Operation *alloc = take->getOperand(0).getDefiningOp();
+    Operation *newAlloc = builder.clone(*alloc);
+    IRMapping mapping;
+    mapping.map(alloc->getResult(0), newAlloc->getResult(0));
+    folded = builder.clone(*take, mapping)->getResult(0);
+  }
   if (divisor) {
     auto identity = AffineMap::getMultiDimIdentityMap(rank, ctx);
     SmallVector<utils::IteratorType> iterators(rank,
                                                utils::IteratorType::parallel);
     Type elemType = sourceType.getElementType();
     linalg::GenericOp::create(
-        builder, loc, TypeRange{}, ValueRange{source}, ValueRange{source},
+        builder, loc, TypeRange{}, ValueRange{source}, ValueRange{folded},
         ArrayRef<AffineMap>{identity, identity}, iterators,
         [&](OpBuilder &b, Location l, ValueRange args) {
           Value one = arith::ConstantOp::create(
@@ -5326,7 +5382,7 @@ bool foldMaterializedBroadcast(::loom::BroadcastOp broadcast) {
       }
       maps[idx] = AffineMap::get(rank, 0, exprs, ctx);
       foldedDims[idx] = dim;
-      input->set(source);
+      input->set(folded);
       if (divisor) {
         BlockArgument arg = consumer.getRegion().front().getArgument(idx);
         for (Operation *user : llvm::make_early_inc_range(arg.getUsers())) {
@@ -5344,11 +5400,20 @@ bool foldMaterializedBroadcast(::loom::BroadcastOp broadcast) {
                       builder.getDenseI64ArrayAttr(foldedDims));
   }
 
-  // The source is now read by the consumers: release it after the last one.
-  for (Operation *user : llvm::make_early_inc_range(source.getUsers()))
-    if (isa<::loom::SemaphoreGiveOp>(user) && user->getBlock() == block &&
-        broadcast->isBeforeInBlock(user) && user->isBeforeInBlock(lastConsumer))
-      user->moveAfter(lastConsumer);
+  if (folded != source) {
+    // The reciprocal buffer is released after the last consumer.
+    OpBuilder giveBuilder(lastConsumer->getContext());
+    giveBuilder.setInsertionPointAfter(lastConsumer);
+    Operation *give = giveBuilder.clone(*bufferGive.getOperation());
+    give->setOperand(0, folded);
+  } else {
+    // The source is now read by the consumers: release it after the last one.
+    for (Operation *user : llvm::make_early_inc_range(source.getUsers()))
+      if (isa<::loom::SemaphoreGiveOp>(user) && user->getBlock() == block &&
+          broadcast->isBeforeInBlock(user) &&
+          user->isBeforeInBlock(lastConsumer))
+        user->moveAfter(lastConsumer);
+  }
 
   broadcast->erase();
   eraseUnusedBuffer(buffer);
@@ -5362,4 +5427,53 @@ void mlir::loom::foldMaterializedBroadcasts(ModuleOp module) {
   module.walk([&](::loom::BroadcastOp op) { broadcasts.push_back(op); });
   for (::loom::BroadcastOp op : broadcasts)
     (void)foldMaterializedBroadcast(op);
+}
+
+namespace {
+
+/// The first operation, in program order after `fill` and including nested
+/// regions, that refers to `buffer` other than through a view; null when there
+/// is none.
+Operation *firstUseAfter(Operation *fill, Value buffer) {
+  for (Operation *next = fill->getNextNode(); next; next = next->getNextNode()) {
+    Operation *found = nullptr;
+    next->walk<WalkOrder::PreOrder>([&](Operation *op) {
+      // Views of the buffer are followed to their users.
+      if (op->getNumResults() == 1 &&
+          stripViewLikeWrappers(op->getResult(0)) == buffer)
+        return WalkResult::advance();
+      for (Value operand : op->getOperands())
+        if (stripViewLikeWrappers(operand) == buffer) {
+          found = op;
+          return WalkResult::interrupt();
+        }
+      return WalkResult::advance();
+    });
+    if (found)
+      return found;
+  }
+  return nullptr;
+}
+
+} // namespace
+
+void mlir::loom::eraseOverwrittenAccumulatorFills(ModuleOp module) {
+  SmallVector<linalg::FillOp> fills;
+  module.walk([&](linalg::FillOp op) { fills.push_back(op); });
+  for (linalg::FillOp fill : fills) {
+    if (fill->getNumResults() != 0 || fill.getOutputs().size() != 1 ||
+        fill.getInputs().size() != 1 || !isZeroFloatValue(fill.getInputs()[0]))
+      continue;
+    Value buffer = stripViewLikeWrappers(fill.getOutputs()[0]);
+    Operation *user = firstUseAfter(fill, buffer);
+    if (!user || !isa<linalg::MatmulOp, linalg::BatchMatmulOp,
+                      ::loom::BatchMatmulOp>(user))
+      continue;
+    auto dps = cast<DestinationStyleOpInterface>(user);
+    if (llvm::any_of(dps.getDpsInputs(), [&](Value input) {
+          return stripViewLikeWrappers(input) == buffer;
+        }))
+      continue;
+    fill->erase();
+  }
 }

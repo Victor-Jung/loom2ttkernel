@@ -1897,60 +1897,6 @@ findUniqueCopyForBuffer(func::FuncOp func, Value buffer, bool wantLoad,
   return matches.front();
 }
 
-static FailureOr<::loom::CopyOp>
-findUniqueOutputStoreForBuffer(func::FuncOp func, Value buffer,
-                               StringRef description) {
-  Value canonicalBuffer = stripViewLikeWrappers(buffer);
-  SmallVector<Value, 4> worklist;
-  SmallVector<Value, 4> visited;
-  SmallVector<::loom::CopyOp, 2> matches;
-
-  auto hasValue = [](ArrayRef<Value> values, Value value) {
-    for (Value existing : values)
-      if (existing == value)
-        return true;
-    return false;
-  };
-
-  auto enqueue = [&](Value value) {
-    Value canonicalValue = stripViewLikeWrappers(value);
-    if (!canonicalValue || hasValue(visited, canonicalValue) ||
-        hasValue(worklist, canonicalValue))
-      return;
-    worklist.push_back(canonicalValue);
-  };
-
-  enqueue(canonicalBuffer);
-  for (unsigned idx = 0; idx < worklist.size(); ++idx) {
-    Value current = worklist[idx];
-    visited.push_back(current);
-
-    func.walk([&](::loom::CopyOp copyOp) {
-      if (stripViewLikeWrappers(copyOp.getSource()) != current)
-        return;
-
-      if (isLoomStoreOp(copyOp)) {
-        matches.push_back(copyOp);
-        return;
-      }
-
-      if (isLoomLocalCopyOp(copyOp))
-        enqueue(copyOp.getDestination());
-    });
-  }
-
-  if (matches.empty()) {
-    func.emitError() << "expected a store loom.copy for " << description;
-    return failure();
-  }
-  if (matches.size() != 1) {
-    func.emitError() << "expected exactly one store loom.copy for "
-                     << description << ", found " << matches.size();
-    return failure();
-  }
-  return matches.front();
-}
-
 struct MatmulMergeOperands {
   Operation *op;
   Value lhs;
@@ -2015,9 +1961,9 @@ static LogicalResult annotateMatmulBReaderMerge(func::FuncOp func) {
     return matmulOp.op->emitOpError()
            << "matmul B-reader merge expects two inputs and one output";
   }
-  if (loadCopyCount != 2 || storeCopyCount != 1) {
+  if (loadCopyCount < 2 || storeCopyCount != 1) {
     return func.emitError()
-           << "matmul B-reader merge expects exactly two load loom.copy ops "
+           << "matmul B-reader merge expects at least two load loom.copy ops "
               "and one store loom.copy op";
   }
 
@@ -2033,10 +1979,13 @@ static LogicalResult annotateMatmulBReaderMerge(func::FuncOp func) {
   if (failed(rhsLoad))
     return failure();
 
-  FailureOr<::loom::CopyOp> outputStore =
-      findUniqueOutputStoreForBuffer(func, matmulOp.out, "matmul output");
-  if (failed(outputStore))
-    return failure();
+  // The single store writes the matmul output, or the result of an epilogue
+  // computed from it.
+  ::loom::CopyOp outputStore;
+  func.walk([&](::loom::CopyOp copyOp) {
+    if (isLoomStoreOp(copyOp))
+      outputStore = copyOp;
+  });
 
   OpBuilder builder(func.getContext());
   func->setAttr(kPartitionStrategyAttrName,
@@ -2049,8 +1998,14 @@ static LogicalResult annotateMatmulBReaderMerge(func::FuncOp func) {
                       builder.getStringAttr(kReaderDataMovementRole));
   (*rhsLoad)->setAttr(kCopyDataMovementRoleAttrName,
                       builder.getStringAttr(kWriterDataMovementRole));
-  (*outputStore)->setAttr(kCopyDataMovementRoleAttrName,
+  outputStore->setAttr(kCopyDataMovementRoleAttrName,
                           builder.getStringAttr(kWriterDataMovementRole));
+  // Other loads (epilogue operands such as a bias) stay on the reader.
+  func.walk([&](::loom::CopyOp copyOp) {
+    if (isLoomLoadOp(copyOp) && getCopyDataMovementRole(copyOp).empty())
+      copyOp->setAttr(kCopyDataMovementRoleAttrName,
+                      builder.getStringAttr(kReaderDataMovementRole));
+  });
   return success();
 }
 
