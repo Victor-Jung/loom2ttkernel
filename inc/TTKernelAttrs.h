@@ -52,6 +52,10 @@ inline constexpr llvm::StringLiteral kFoldedBroadcastDimsAttrName =
 /// tile ops.
 inline constexpr llvm::StringLiteral kFpuElementwiseAttrName =
     "loom.ttkernel.fpu_elementwise";
+/// On the module: sum the slices of a stack (a split reduction's merge) with
+/// FPU adds instead of copy_tile + SFPU add_binary_tile.
+inline constexpr llvm::StringLiteral kFpuStackReduceAttrName =
+    "loom.ttkernel.fpu_stack_reduce";
 /// On the module: DRAM tiles a reader or writer issues between NoC barriers
 /// (0: one barrier per transfer). Absent: a heuristic on the core count.
 inline constexpr llvm::StringLiteral kDramBatchTilesAttrName =

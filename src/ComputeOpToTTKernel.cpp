@@ -404,6 +404,77 @@ static bool isTileGenericOp(linalg::GenericOp op) {
   return true;
 }
 
+static FailureOr<Value>
+createEmitCCBLiteral(ConversionPatternRewriter &rewriter, Location loc,
+                     Value cb);
+
+static bool isFpuStackReduceEnabled(Operation *op) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (parent->hasAttr(kFpuStackReduceAttrName))
+      return true;
+  return false;
+}
+
+/// Sum of the slices of a stack with FPU adds: per block of output tiles,
+/// copy slice 0 into DST, then add each other slice into it with
+/// binary_dest_reuse_tiles (DST to SRCA, the slice's tile from the CB to
+/// SRCB). Four times faster than copy_tile + SFPU add_binary_tile per slice
+/// on Blackhole (loom/tmp_output/hw_probe/gather_probe.py).
+static LogicalResult emitFpuStackSum(ConversionPatternRewriter &rewriter,
+                                     Location loc, Value inCb, Value outCb,
+                                     int64_t outTiles, int64_t reduceSlices) {
+  FailureOr<Value> inLiteral = createEmitCCBLiteral(rewriter, loc, inCb);
+  if (failed(inLiteral))
+    return failure();
+  auto i32 = [&](int64_t value) -> Value {
+    return rewriter.create<arith::ConstantIntOp>(loc, value, 32);
+  };
+  const int64_t block = outTiles % 4 == 0 ? 4 : outTiles % 2 == 0 ? 2 : 1;
+  StringRef reuse =
+      "binary_dest_reuse_tiles<ELWADD, EltwiseBinaryReuseDestType::DEST_TO_SRCA>";
+  StringRef reuseInit = "binary_dest_reuse_tiles_init<ELWADD, "
+                        "EltwiseBinaryReuseDestType::DEST_TO_SRCA>";
+  Value outTilesV = i32(outTiles);
+  scf::ForOp blockLoop =
+      scf::ForOp::create(rewriter, loc, i32(0), outTilesV, i32(block));
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(blockLoop.getBody());
+  Value base = blockLoop.getInductionVar();
+  SmallVector<Value> dst, outTile;
+  for (int64_t d = 0; d < block; ++d) {
+    dst.push_back(i32(d));
+    outTile.push_back(arith::AddIOp::create(rewriter, loc, base, dst.back()));
+  }
+  TileRegsAcquireOp::create(rewriter, loc);
+  rewriter.create<CopyTileInitOp>(loc, inCb);
+  for (int64_t d = 0; d < block; ++d)
+    rewriter.create<CopyTileOp>(loc, inCb, outTile[d], dst[d]);
+  rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange(), reuseInit, nullptr,
+                                       nullptr, ValueRange{*inLiteral});
+  scf::ForOp sliceLoop =
+      scf::ForOp::create(rewriter, loc, i32(1), i32(reduceSlices), i32(1));
+  {
+    OpBuilder::InsertionGuard sliceGuard(rewriter);
+    rewriter.setInsertionPointToStart(sliceLoop.getBody());
+    Value offset = arith::MulIOp::create(rewriter, loc,
+                                         sliceLoop.getInductionVar(), outTilesV);
+    for (int64_t d = 0; d < block; ++d) {
+      Value tile = arith::AddIOp::create(rewriter, loc, offset, outTile[d]);
+      rewriter.create<emitc::CallOpaqueOp>(
+          loc, TypeRange(), reuse, nullptr, nullptr,
+          ValueRange{*inLiteral, tile, dst[d]});
+    }
+  }
+  rewriter.setInsertionPointAfter(sliceLoop);
+  TileRegsCommitOp::create(rewriter, loc);
+  TileRegsWaitOp::create(rewriter, loc);
+  for (int64_t d = 0; d < block; ++d)
+    PackTileOp::create(rewriter, loc, dst[d], outCb, outTile[d]);
+  TileRegsReleaseOp::create(rewriter, loc);
+  return success();
+}
+
 /**
  * @brief Entry-point for [reduction, parallel, parallel] generic lowering.
  *
@@ -487,6 +558,17 @@ static LogicalResult tileGenericOp(
   emitWaitFront(inCb, inputTiles);
 
   CBReserveBackOp::create(rewriter, loc, outCb, outTilesV);
+  if (analysis.combineOp == TileReductionCombineOp::Sum && reduceSlices > 1 &&
+      isFpuStackReduceEnabled(op)) {
+    if (failed(emitFpuStackSum(rewriter, loc, inCb, outCb, outTiles,
+                               reduceSlices)))
+      return failure();
+    CBPushBackOp::create(rewriter, loc, outCb, outTilesV);
+    waitState[outCb] = 0;
+    waitState[inCb] = 0;
+    rewriter.eraseOp(op);
+    return success();
+  }
   rewriter.create<CopyTileInitOp>(loc, inCb);
   if (analysis.combineOp == TileReductionCombineOp::Sum)
     rewriter.create<AddBinaryTilesInitOp>(loc);

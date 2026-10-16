@@ -722,6 +722,12 @@ public:
                 "Drop zero fills of a matmul output that the first k block "
                 "overwrites"),
             llvm::cl::init(true)),
+        fpuStackReduce(
+            *this, "fpu-stack-reduce",
+            llvm::cl::desc(
+                "Sum the slices of a stack (a split reduction's merge) with "
+                "FPU adds instead of copy_tile + SFPU add_binary_tile"),
+            llvm::cl::init(false)),
         dramBatchTiles(
             *this, "dram-batch-tiles",
             llvm::cl::desc(
@@ -770,6 +776,12 @@ public:
                 "Drop zero fills of a matmul output that the first k block "
                 "overwrites"),
             llvm::cl::init(true)),
+        fpuStackReduce(
+            *this, "fpu-stack-reduce",
+            llvm::cl::desc(
+                "Sum the slices of a stack (a split reduction's merge) with "
+                "FPU adds instead of copy_tile + SFPU add_binary_tile"),
+            llvm::cl::init(false)),
         dramBatchTiles(
             *this, "dram-batch-tiles",
             llvm::cl::desc(
@@ -794,6 +806,7 @@ public:
         static_cast<bool>(other.matmulStreamOutputSubblocks);
     fpuElementwise = static_cast<bool>(other.fpuElementwise);
     elideAccumulatorZeroFill = static_cast<bool>(other.elideAccumulatorZeroFill);
+    fpuStackReduce = static_cast<bool>(other.fpuStackReduce);
     dramBatchTiles = static_cast<int64_t>(other.dramBatchTiles);
     reduceProtocolOpt = other.reduceProtocolOpt;
     reduceProtocolDeprecated = other.reduceProtocolDeprecated;
@@ -826,6 +839,7 @@ public:
   Option<bool> matmulStreamOutputSubblocks;
   Option<bool> fpuElementwise;
   Option<bool> elideAccumulatorZeroFill;
+  Option<bool> fpuStackReduce;
   Option<int64_t> dramBatchTiles;
   Option<std::string> reduceProtocolOpt;
   /// @deprecated Use reduce-protocol instead.
@@ -912,6 +926,8 @@ public:
     }
     if (elideAccumulatorZeroFill)
       eraseOverwrittenAccumulatorFills(module);
+    if (fpuStackReduce)
+      module->setAttr(kFpuStackReduceAttrName, UnitAttr::get(&getContext()));
     if (dramBatchTiles >= 0)
       module->setAttr(kDramBatchTilesAttrName,
                       IntegerAttr::get(IntegerType::get(&getContext(), 64),
@@ -1170,6 +1186,7 @@ public:
     eraseLoomLoopAttrs(module);
     module->removeAttr(kFpuElementwiseAttrName);
     module->removeAttr(kDramBatchTilesAttrName);
+    module->removeAttr(kFpuStackReduceAttrName);
 
     // Post-conversion: Remove all function arguments.
     // After conversion, memref args used in reinterpret_cast should be dead
